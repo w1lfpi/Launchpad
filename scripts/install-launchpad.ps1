@@ -39,6 +39,22 @@ if ([string]::IsNullOrWhiteSpace($Executable) -or
 $sourceExecutable = (Resolve-Path -LiteralPath $Executable).Path
 $InstallDirectory = [IO.Path]::GetFullPath($InstallDirectory)
 $installedExecutable = Join-Path $InstallDirectory "Launchpad.exe"
+$dataDirectory = [IO.Path]::GetFullPath(
+    (Join-Path $env:LOCALAPPDATA "WindowsLaunchpad"))
+$destinationApplications = [IO.Path]::GetFullPath(
+    (Join-Path $dataDirectory "Applications"))
+$desktopApplications = [IO.Path]::GetFullPath(
+    (Join-Path `
+        ([Environment]::GetFolderPath("Desktop")) `
+        "Launchpad Applications"))
+$destinationLayout =
+    Join-Path $dataDirectory "LaunchpadLayout.store"
+$catalogMarker =
+    Join-Path $dataDirectory ".catalog-initialized"
+$legacyApplications =
+    Join-Path $InstallDirectory "Applications"
+$legacyLayout =
+    Join-Path $InstallDirectory "LaunchpadLayout.store"
 
 $matchingPaths = @(
     $sourceExecutable,
@@ -80,30 +96,165 @@ $sourceRoot = $sourceRoots |
     } |
     Select-Object -First 1
 
-$destinationApplications =
-    Join-Path $InstallDirectory "Applications"
-if (-not (Test-Path `
-        -LiteralPath $destinationApplications `
-        -PathType Container)) {
-    if ($sourceRoot) {
-        Copy-Item `
-            -LiteralPath (Join-Path $sourceRoot "Applications") `
-            -Destination $destinationApplications `
-            -Recurse
-    } else {
-        New-Item `
-            -ItemType Directory `
-            -Path $destinationApplications |
-            Out-Null
+$storedCatalogPath = $null
+if (Test-Path -LiteralPath $catalogMarker -PathType Leaf) {
+    try {
+        $storedCatalogPath = [IO.Path]::GetFullPath(
+            [IO.File]::ReadAllText($catalogMarker).Trim())
+    } catch {
+        $storedCatalogPath = $null
     }
 }
+$storedCatalogTrusted =
+    -not [string]::IsNullOrWhiteSpace($storedCatalogPath) -and
+    ($storedCatalogPath.Equals(
+            $destinationApplications,
+            [StringComparison]::OrdinalIgnoreCase) -or
+     $storedCatalogPath.Equals(
+            $desktopApplications,
+            [StringComparison]::OrdinalIgnoreCase))
+$catalogInitialized =
+    $storedCatalogTrusted -and
+    $storedCatalogPath.Equals(
+        $destinationApplications,
+        [StringComparison]::OrdinalIgnoreCase)
 
-$destinationLayout =
-    Join-Path $InstallDirectory "LaunchpadLayout.store"
-if ($sourceRoot -and
-    -not (Test-Path -LiteralPath $destinationLayout)) {
-    $sourceLayout = Join-Path $sourceRoot "LaunchpadLayout.store"
-    if (Test-Path -LiteralPath $sourceLayout -PathType Leaf) {
+if (-not $catalogInitialized) {
+    $destinationHadContent =
+        (Test-Path `
+            -LiteralPath $destinationApplications `
+            -PathType Container) -and
+        (@(Get-ChildItem `
+            -LiteralPath $destinationApplications `
+            -Force `
+            -ErrorAction SilentlyContinue).Count -gt 0)
+
+    New-Item -ItemType Directory -Path $dataDirectory -Force |
+        Out-Null
+    New-Item -ItemType Directory -Path $destinationApplications -Force |
+        Out-Null
+
+    function Copy-MissingLaunchpadItems(
+        [string]$Source,
+        [string]$Destination,
+        [bool]$OverwriteExisting = $false) {
+        if (-not (Test-Path -LiteralPath $Source -PathType Container) -or
+            $Source.Equals(
+                $Destination,
+                [StringComparison]::OrdinalIgnoreCase)) {
+            return
+        }
+
+        foreach ($item in Get-ChildItem -LiteralPath $Source -Force) {
+            $target = Join-Path $Destination $item.Name
+            if ($item.PSIsContainer) {
+                if (($item.Attributes -band
+                        [IO.FileAttributes]::ReparsePoint) -ne 0) {
+                    continue
+                }
+                New-Item -ItemType Directory -Path $target -Force |
+                    Out-Null
+                Copy-MissingLaunchpadItems `
+                    -Source $item.FullName `
+                    -Destination $target `
+                    -OverwriteExisting $OverwriteExisting
+            } elseif ($OverwriteExisting -or
+                -not (Test-Path -LiteralPath $target)) {
+                Copy-Item `
+                    -LiteralPath $item.FullName `
+                    -Destination $target `
+                    -Force
+            }
+        }
+    }
+
+    function Test-LaunchpadCatalogCopy(
+        [string]$Source,
+        [string]$Destination) {
+        foreach ($sourceFile in Get-ChildItem `
+                -LiteralPath $Source `
+                -Recurse `
+                -Force `
+                -File) {
+            $relativePath = $sourceFile.FullName.Substring(
+                $Source.TrimEnd("\").Length).TrimStart("\")
+            $destinationFile =
+                Join-Path $Destination $relativePath
+            if (-not (Test-Path `
+                    -LiteralPath $destinationFile `
+                    -PathType Leaf)) {
+                return $false
+            }
+            if ((Get-FileHash `
+                    -LiteralPath $sourceFile.FullName `
+                    -Algorithm SHA256).Hash -ne
+                (Get-FileHash `
+                    -LiteralPath $destinationFile `
+                    -Algorithm SHA256).Hash) {
+                return $false
+            }
+        }
+        return $true
+    }
+
+    $authoritativeCatalog = $null
+    if ($storedCatalogTrusted -and
+        -not $storedCatalogPath.Equals(
+            $destinationApplications,
+            [StringComparison]::OrdinalIgnoreCase) -and
+        (Test-Path `
+            -LiteralPath $storedCatalogPath `
+            -PathType Container)) {
+        $authoritativeCatalog = $storedCatalogPath
+    } elseif (Test-Path `
+            -LiteralPath $desktopApplications `
+            -PathType Container) {
+        $authoritativeCatalog = $desktopApplications
+    }
+
+    if ($authoritativeCatalog) {
+        $applicationSources = @($authoritativeCatalog)
+    } elseif ($destinationHadContent) {
+        $applicationSources = @()
+    } else {
+        $applicationSources = @($legacyApplications)
+        if ($sourceRoot) {
+            $applicationSources +=
+                Join-Path $sourceRoot "Applications"
+        }
+    }
+
+    foreach ($applicationSource in $applicationSources) {
+        Copy-MissingLaunchpadItems `
+            -Source ([IO.Path]::GetFullPath($applicationSource)) `
+            -Destination $destinationApplications `
+            -OverwriteExisting (
+                $authoritativeCatalog -and
+                $applicationSource.Equals(
+                    $authoritativeCatalog,
+                    [StringComparison]::OrdinalIgnoreCase))
+    }
+    if ($authoritativeCatalog -and
+        -not (Test-LaunchpadCatalogCopy `
+            -Source $authoritativeCatalog `
+            -Destination $destinationApplications)) {
+        throw "Launchpad catalog migration could not be verified."
+    }
+
+    $layoutCandidates = @(
+        $destinationLayout,
+        $legacyLayout
+    )
+    if ($sourceRoot) {
+        $layoutCandidates +=
+            Join-Path $sourceRoot "LaunchpadLayout.store"
+    }
+    $layoutSource = $layoutCandidates |
+        Select-Object -Unique |
+        Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } |
+        Select-Object -First 1
+
+    if ($layoutSource) {
         function ConvertTo-LaunchpadHex([string]$Value) {
             $builder = [Text.StringBuilder]::new(
                 $Value.Length * 8)
@@ -115,14 +266,17 @@ if ($sourceRoot -and
             return $builder.ToString()
         }
 
-        $sourceApplications =
-            Join-Path $sourceRoot "Applications"
-        $sourcePrefix =
-            ConvertTo-LaunchpadHex $sourceApplications
+        $sourcePrefixes = $applicationSources |
+            ForEach-Object {
+                ConvertTo-LaunchpadHex (
+                    [IO.Path]::GetFullPath($_).TrimEnd("\") + "\")
+            } |
+            Select-Object -Unique
         $destinationPrefix =
-            ConvertTo-LaunchpadHex $destinationApplications
+            ConvertTo-LaunchpadHex (
+                $destinationApplications.TrimEnd("\") + "\")
         $layoutLines = [IO.File]::ReadAllLines(
-            $sourceLayout,
+            $layoutSource,
             [Text.Encoding]::UTF8)
 
         for ($lineIndex = 0;
@@ -142,22 +296,67 @@ if ($sourceRoot -and
             for ($fieldIndex = $firstPathField;
                  $fieldIndex -lt $fields.Length;
                  $fieldIndex++) {
-                if ($fields[$fieldIndex].StartsWith(
-                        $sourcePrefix,
-                        [StringComparison]::OrdinalIgnoreCase)) {
-                    $fields[$fieldIndex] =
-                        $destinationPrefix +
-                        $fields[$fieldIndex].Substring(
-                            $sourcePrefix.Length)
+                foreach ($sourcePrefix in $sourcePrefixes) {
+                    if ($fields[$fieldIndex].StartsWith(
+                            $sourcePrefix,
+                            [StringComparison]::OrdinalIgnoreCase)) {
+                        $fields[$fieldIndex] =
+                            $destinationPrefix +
+                            $fields[$fieldIndex].Substring(
+                                $sourcePrefix.Length)
+                        break
+                    }
                 }
             }
             $layoutLines[$lineIndex] = $fields -join "`t"
         }
 
-        [IO.File]::WriteAllLines(
-            $destinationLayout,
-            $layoutLines,
-            [Text.UTF8Encoding]::new($false))
+        $temporaryLayout =
+            $destinationLayout + ".migration-" + $PID + ".tmp"
+        try {
+            [IO.File]::WriteAllLines(
+                $temporaryLayout,
+                $layoutLines,
+                [Text.UTF8Encoding]::new($false))
+            Move-Item `
+                -LiteralPath $temporaryLayout `
+                -Destination $destinationLayout `
+                -Force
+        } finally {
+            Remove-Item `
+                -LiteralPath $temporaryLayout `
+                -Force `
+                -ErrorAction SilentlyContinue
+        }
+    }
+
+    $temporaryMarker =
+        $catalogMarker + ".migration-" + $PID + ".tmp"
+    [IO.File]::WriteAllText(
+        $temporaryMarker,
+        $destinationApplications,
+        [Text.UTF8Encoding]::new($false))
+    Move-Item `
+        -LiteralPath $temporaryMarker `
+        -Destination $catalogMarker `
+        -Force
+    (Get-Item -LiteralPath $catalogMarker).Attributes =
+        [IO.FileAttributes]::Hidden
+
+    if ($authoritativeCatalog -and
+        $authoritativeCatalog.Equals(
+            $desktopApplications,
+            [StringComparison]::OrdinalIgnoreCase)) {
+        try {
+            Remove-Item `
+                -LiteralPath $desktopApplications `
+                -Recurse `
+                -Force
+        } catch {
+            Write-Warning (
+                "The migrated Desktop catalog could not be removed: " +
+                $desktopApplications)
+        }
     }
 }
 
@@ -216,6 +415,10 @@ if (-not $DoNotStart) {
 Write-Host ""
 Write-Host "Windows Launchpad installed:"
 Write-Host $installedExecutable
+Write-Host "Applications:"
+Write-Host $destinationApplications
+Write-Host "Layout and settings:"
+Write-Host $dataDirectory
 Write-Host ""
 Write-Host "Pin it: Start > All apps > Launchpad > Pin to taskbar."
 Write-Host "No administrator rights were used."

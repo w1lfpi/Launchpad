@@ -13,6 +13,10 @@ if ([string]::IsNullOrWhiteSpace($InstallDirectory)) {
 }
 $InstallDirectory = [IO.Path]::GetFullPath($InstallDirectory)
 $installedExecutable = Join-Path $InstallDirectory "Launchpad.exe"
+$dataDirectory = [IO.Path]::GetFullPath(
+    (Join-Path $env:LOCALAPPDATA "WindowsLaunchpad"))
+$applicationsDirectory = [IO.Path]::GetFullPath(
+    (Join-Path $dataDirectory "Applications"))
 
 if (Test-Path -LiteralPath $installedExecutable -PathType Leaf) {
     $shortcutProcess = Start-Process `
@@ -76,6 +80,27 @@ if ($RemoveUserData) {
         -Recurse `
         -Force `
         -ErrorAction SilentlyContinue
+    if (-not $dataDirectory.Equals(
+            $InstallDirectory,
+            [StringComparison]::OrdinalIgnoreCase)) {
+        Remove-Item `
+            -LiteralPath $dataDirectory `
+            -Recurse `
+            -Force `
+            -ErrorAction SilentlyContinue
+    }
+    if (-not $applicationsDirectory.Equals(
+            $InstallDirectory,
+            [StringComparison]::OrdinalIgnoreCase) -and
+        -not $applicationsDirectory.Equals(
+            $dataDirectory,
+            [StringComparison]::OrdinalIgnoreCase)) {
+        Remove-Item `
+            -LiteralPath $applicationsDirectory `
+            -Recurse `
+            -Force `
+            -ErrorAction SilentlyContinue
+    }
     Write-Host "Windows Launchpad and its user data were removed."
     return
 }
@@ -90,5 +115,7 @@ foreach ($fileName in @(
         -ErrorAction SilentlyContinue
 }
 Write-Host "Windows Launchpad was removed."
-Write-Host "Applications and LaunchpadLayout.store were preserved:"
-Write-Host $InstallDirectory
+Write-Host "Applications were preserved:"
+Write-Host $applicationsDirectory
+Write-Host "Layout and settings were preserved:"
+Write-Host $dataDirectory

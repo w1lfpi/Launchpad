@@ -30,7 +30,7 @@ $items = Get-ChildItem `
 Write-Host ("Launchable Start Menu items: " + @($items).Count)
 
 $applicationsDirectory = Join-Path `
-    (Split-Path -Parent $PSScriptRoot) `
+    (Join-Path $env:LOCALAPPDATA "WindowsLaunchpad") `
     "Applications"
 $catalogItems = Get-ChildItem `
     -LiteralPath $applicationsDirectory `

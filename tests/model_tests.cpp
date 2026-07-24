@@ -177,6 +177,65 @@ int main() {
            "folder application order survives a roundtrip");
     std::filesystem::remove(folder_roundtrip_path);
 
+    const std::filesystem::path rescan_addition_path =
+        test_store_path("rescan-addition");
+    std::filesystem::remove(rescan_addition_path);
+    const std::vector<std::pair<std::wstring, std::wstring>>
+        initial_rescan_apps{
+            {L"C:\\Apps\\Alpha.lnk", L"Alpha"},
+            {L"C:\\Apps\\Beta.lnk", L"Beta"},
+        };
+    LayoutDocument rescan_addition_layout;
+    expect(rescan_addition_layout.reconcile(initial_rescan_apps),
+           "existing applications populate the rescan fixture");
+    expect(save_layout(
+               rescan_addition_path,
+               rescan_addition_layout),
+           "existing layout can be saved before a rescan");
+    LayoutDocument loaded_rescan_layout;
+    expect(load_layout(
+               rescan_addition_path,
+               loaded_rescan_layout),
+           "existing layout can be loaded before a rescan");
+    const std::vector<std::pair<std::wstring, std::wstring>>
+        rescanned_apps{
+            {L"C:\\Apps\\Alpha.lnk", L"Alpha"},
+            {L"C:\\Apps\\Beta.lnk", L"Beta"},
+            {L"C:\\Apps\\New.lnk", L"New"},
+        };
+    expect(loaded_rescan_layout.reconcile(rescanned_apps),
+           "a rescan adds a newly discovered application");
+    expect(loaded_rescan_layout.items().size() == 3 &&
+               loaded_rescan_layout.items()[0].app_path ==
+                   L"C:\\Apps\\Alpha.lnk" &&
+               loaded_rescan_layout.items()[1].app_path ==
+                   L"C:\\Apps\\Beta.lnk" &&
+               loaded_rescan_layout.items()[2].kind ==
+                   LayoutItemKind::app &&
+               loaded_rescan_layout.items()[2].app_path ==
+                   L"C:\\Apps\\New.lnk" &&
+               loaded_rescan_layout.items()[2].name == L"New",
+           "the newly discovered application is appended exactly once");
+    expect(save_layout(
+               rescan_addition_path,
+               loaded_rescan_layout),
+           "layout with a newly discovered application can be saved");
+    LayoutDocument reloaded_rescan_layout;
+    expect(load_layout(
+               rescan_addition_path,
+               reloaded_rescan_layout),
+           "layout with a newly discovered application can be reloaded");
+    expect(reloaded_rescan_layout.items() ==
+               loaded_rescan_layout.items(),
+           "the newly discovered application survives a roundtrip");
+    const std::vector<LayoutItem> before_second_rescan =
+        reloaded_rescan_layout.items();
+    expect(!reloaded_rescan_layout.reconcile(rescanned_apps) &&
+               reloaded_rescan_layout.items() ==
+                   before_second_rescan,
+           "a second identical rescan leaves the layout unchanged");
+    std::filesystem::remove(rescan_addition_path);
+
     LayoutDocument dissolving_folder;
     dissolving_folder.reconcile({
         {L"C:\\Apps\\One.lnk", L"One"},
@@ -570,6 +629,23 @@ int main() {
            "moving the only last-page item to a new last page is a no-op");
     expect(!paged_layout.reconcile(page_apps),
            "reconcile preserves a valid page break unchanged");
+
+    LayoutDocument paged_addition_layout = paged_layout;
+    auto page_apps_with_addition = page_apps;
+    page_apps_with_addition.emplace_back(
+        L"C:\\Apps\\PageNew.lnk",
+        L"Page New");
+    expect(paged_addition_layout.reconcile(
+               page_apps_with_addition),
+           "a rescan appends a new app to an explicit page layout");
+    expect(paged_addition_layout.items().size() == 37 &&
+               paged_addition_layout.items()[34].kind ==
+                   LayoutItemKind::page_break &&
+               paged_addition_layout.items()[35].app_path ==
+                   page_apps[34].first &&
+               paged_addition_layout.items()[36].app_path ==
+                   L"C:\\Apps\\PageNew.lnk",
+           "a rescan preserves the page break and existing order");
 
     LayoutDocument moved_back_layout = paged_layout;
     expect(moved_back_layout.move_item(35, 0),

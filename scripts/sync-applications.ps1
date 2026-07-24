@@ -7,7 +7,9 @@ param(
 $ErrorActionPreference = "Stop"
 
 if ([string]::IsNullOrWhiteSpace($Destination)) {
-    $Destination = Join-Path (Split-Path -Parent $PSScriptRoot) "Applications"
+    $Destination = Join-Path `
+        (Join-Path $env:LOCALAPPDATA "WindowsLaunchpad") `
+        "Applications"
 }
 
 New-Item -ItemType Directory -Path $Destination -Force | Out-Null

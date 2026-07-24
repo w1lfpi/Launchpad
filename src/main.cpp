@@ -53,11 +53,16 @@ constexpr wchar_t kAppUserModelId[] =
 constexpr wchar_t kShortcutName[] = L"Launchpad.lnk";
 constexpr UINT_PTR kAnimationTimer = 1;
 constexpr UINT_PTR kExternalDropRescanTimer = 2;
+constexpr UINT_PTR kApplicationsWatchTimer = 3;
 constexpr int kGlobalHotkeyId = 1;
 constexpr UINT kShowLaunchpadMessage = WM_APP + 42;
 constexpr UINT kExternalDropCompletedMessage = WM_APP + 43;
 constexpr UINT kExternalDropRescanDelayMs = 160;
 constexpr int kExternalDropRescanAttempts = 20;
+constexpr UINT kApplicationsWatchIntervalMs = 800;
+constexpr int kApplicationsRemovalConfirmations = 3;
+constexpr wchar_t kCatalogDirectoryName[] = L"WindowsLaunchpad";
+constexpr wchar_t kCatalogMarkerName[] = L".catalog-initialized";
 constexpr UINT kBaseIconRequestPixels = 256;
 constexpr float kLargestIconSlotDips = 112.0F;
 constexpr float kSwipeThresholdDips = 56.0F;
@@ -208,6 +213,23 @@ float spring_ease_out(float value) {
     return 1.0F - decay *
         (std::cos(omega_d * value) +
          damping / root * std::sin(omega_d * value));
+}
+
+void clear_startup_feedback_cursor() {
+    MSG message{};
+    PeekMessageW(
+        &message,
+        nullptr,
+        WM_USER,
+        WM_USER,
+        PM_NOREMOVE);
+    if (PostThreadMessageW(
+            GetCurrentThreadId(),
+            WM_NULL,
+            0,
+            0)) {
+        GetMessageW(&message, nullptr, 0, 0);
+    }
 }
 
 float lerp(float from, float to, float progress) {
@@ -375,118 +397,721 @@ wchar_t first_glyph(std::wstring_view name) {
 
 void add_unique_app(
     std::vector<AppEntry>& apps,
-    std::unordered_set<std::wstring>& names,
+    std::unordered_set<std::wstring>& paths,
     std::wstring name,
     std::wstring path) {
     if (name.empty() || path.empty()) {
         return;
     }
-    const std::wstring normalized = launchpad::lowercase(name);
-    if (!names.insert(normalized).second) {
+    const std::wstring normalized_path =
+        launchpad::lowercase(
+            fs::path(path).lexically_normal().wstring());
+    if (!paths.insert(normalized_path).second) {
         return;
     }
+    const std::wstring normalized_name =
+        launchpad::lowercase(name);
     apps.push_back(AppEntry{
         .name = std::move(name),
         .path = std::move(path),
-        .color = accent_color(normalized),
-        .glyph = first_glyph(normalized),
+        .color = accent_color(normalized_name),
+        .glyph = first_glyph(normalized_name),
     });
 }
 
-fs::path find_applications_directory() {
+struct CatalogSetup {
+    fs::path applications_directory;
+    fs::path layout_path;
+    fs::path marker_path;
+    fs::path legacy_layout_path;
+    fs::path legacy_layout_applications;
+    std::vector<fs::path> legacy_applications;
+    bool needs_initialization = false;
+    bool migration_succeeded = true;
+};
+
+std::optional<std::string> utf8_from_wide(
+    std::wstring_view value) {
+    if (value.empty()) {
+        return std::string{};
+    }
+    const int byte_count = WideCharToMultiByte(
+        CP_UTF8,
+        WC_ERR_INVALID_CHARS,
+        value.data(),
+        static_cast<int>(value.size()),
+        nullptr,
+        0,
+        nullptr,
+        nullptr);
+    if (byte_count <= 0) {
+        return std::nullopt;
+    }
+    std::string result(static_cast<std::size_t>(byte_count), '\0');
+    if (WideCharToMultiByte(
+            CP_UTF8,
+            WC_ERR_INVALID_CHARS,
+            value.data(),
+            static_cast<int>(value.size()),
+            result.data(),
+            byte_count,
+            nullptr,
+            nullptr) != byte_count) {
+        return std::nullopt;
+    }
+    return result;
+}
+
+std::optional<std::wstring> wide_from_utf8(
+    std::string_view value) {
+    if (value.empty()) {
+        return std::wstring{};
+    }
+    const int character_count = MultiByteToWideChar(
+        CP_UTF8,
+        MB_ERR_INVALID_CHARS,
+        value.data(),
+        static_cast<int>(value.size()),
+        nullptr,
+        0);
+    if (character_count <= 0) {
+        return std::nullopt;
+    }
+    std::wstring result(
+        static_cast<std::size_t>(character_count),
+        L'\0');
+    if (MultiByteToWideChar(
+            CP_UTF8,
+            MB_ERR_INVALID_CHARS,
+            value.data(),
+            static_cast<int>(value.size()),
+            result.data(),
+            character_count) != character_count) {
+        return std::nullopt;
+    }
+    return result;
+}
+
+std::optional<fs::path> catalog_marker_applications_directory(
+    const fs::path& marker) {
+    const HANDLE file = CreateFileW(
+        marker.c_str(),
+        GENERIC_READ,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        nullptr,
+        OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL,
+        nullptr);
+    if (file == INVALID_HANDLE_VALUE) {
+        return std::nullopt;
+    }
+    LARGE_INTEGER size{};
+    if (!GetFileSizeEx(file, &size) ||
+        size.QuadPart <= 0 ||
+        size.QuadPart > 131072) {
+        CloseHandle(file);
+        return std::nullopt;
+    }
+    std::string bytes(
+        static_cast<std::size_t>(size.QuadPart),
+        '\0');
+    DWORD bytes_read = 0;
+    const bool read =
+        ReadFile(
+            file,
+            bytes.data(),
+            static_cast<DWORD>(bytes.size()),
+            &bytes_read,
+            nullptr) != FALSE;
+    CloseHandle(file);
+    if (!read) {
+        return std::nullopt;
+    }
+    bytes.resize(bytes_read);
+    if (bytes.starts_with("\xEF\xBB\xBF")) {
+        bytes.erase(0, 3);
+    }
+    while (!bytes.empty() &&
+           (bytes.back() == '\r' ||
+            bytes.back() == '\n' ||
+            bytes.back() == '\0')) {
+        bytes.pop_back();
+    }
+    const auto stored = wide_from_utf8(bytes);
+    if (!stored || stored->empty()) {
+        return std::nullopt;
+    }
+    return fs::path(*stored);
+}
+
+bool catalog_marker_matches(
+    const fs::path& marker,
+    const fs::path& applications_directory) {
+    const auto stored =
+        catalog_marker_applications_directory(marker);
+    return stored &&
+        launchpad::lowercase(
+            stored->lexically_normal().wstring()) ==
+        launchpad::lowercase(
+            applications_directory.lexically_normal().wstring());
+}
+
+bool mark_catalog_initialized(
+    const fs::path& marker,
+    const fs::path& applications_directory) {
+    if (marker.empty()) {
+        return false;
+    }
+    const auto contents = utf8_from_wide(
+        applications_directory.lexically_normal().wstring());
+    if (!contents) {
+        return false;
+    }
+    const HANDLE file = CreateFileW(
+        marker.c_str(),
+        GENERIC_WRITE,
+        FILE_SHARE_READ,
+        nullptr,
+        CREATE_ALWAYS,
+        FILE_ATTRIBUTE_HIDDEN,
+        nullptr);
+    if (file == INVALID_HANDLE_VALUE) {
+        return false;
+    }
+    DWORD written = 0;
+    const bool succeeded =
+        WriteFile(
+            file,
+            contents->data(),
+            static_cast<DWORD>(contents->size()),
+            &written,
+            nullptr) != FALSE &&
+        written == contents->size();
+    CloseHandle(file);
+    return succeeded;
+}
+
+std::optional<fs::path> executable_directory() {
     std::array<wchar_t, 32768> executable_buffer{};
     const DWORD length = GetModuleFileNameW(
         nullptr,
         executable_buffer.data(),
         static_cast<DWORD>(executable_buffer.size()));
-    if (length > 0 && length < executable_buffer.size()) {
-        fs::path cursor =
-            fs::path(std::wstring_view(executable_buffer.data(), length))
-                .parent_path();
-        for (int depth = 0; depth < 8 && !cursor.empty(); ++depth) {
-            const fs::path candidate = cursor / L"Applications";
-            std::error_code error;
-            if (fs::is_directory(candidate, error)) {
-                return candidate;
-            }
-            const fs::path parent = cursor.parent_path();
-            if (parent == cursor) {
-                break;
-            }
-            cursor = parent;
-        }
+    if (length == 0 || length >= executable_buffer.size()) {
+        return std::nullopt;
     }
+    return fs::path(std::wstring_view(
+        executable_buffer.data(),
+        length)).parent_path();
+}
 
-    std::error_code current_error;
-    const fs::path current_candidate =
-        fs::current_path(current_error) / L"Applications";
-    if (!current_error) {
-        std::error_code directory_error;
-        if (fs::is_directory(current_candidate, directory_error)) {
-            return current_candidate;
-        }
-    }
-
+std::optional<fs::path> local_app_data_directory() {
     PWSTR local_app_data = nullptr;
-    if (SUCCEEDED(SHGetKnownFolderPath(
+    if (FAILED(SHGetKnownFolderPath(
             FOLDERID_LocalAppData,
             KF_FLAG_CREATE,
             nullptr,
-            &local_app_data))) {
-        const fs::path fallback =
-            fs::path(local_app_data) /
-            L"WindowsLaunchpad" /
-            L"Applications";
-        CoTaskMemFree(local_app_data);
-        std::error_code create_error;
-        fs::create_directories(fallback, create_error);
-        return fallback;
+            &local_app_data)) ||
+        !local_app_data) {
+        return std::nullopt;
     }
-
-    std::error_code create_error;
-    fs::create_directories(current_candidate, create_error);
-    return current_candidate;
+    fs::path result(local_app_data);
+    CoTaskMemFree(local_app_data);
+    return result;
 }
 
-void scan_applications_directory(
+std::optional<fs::path> desktop_applications_directory() {
+    PWSTR desktop = nullptr;
+    if (FAILED(SHGetKnownFolderPath(
+            FOLDERID_Desktop,
+            KF_FLAG_CREATE,
+            nullptr,
+            &desktop)) ||
+        !desktop) {
+        return std::nullopt;
+    }
+    fs::path result =
+        fs::path(desktop) /
+        L"Launchpad Applications";
+    CoTaskMemFree(desktop);
+    return result;
+}
+
+std::optional<fs::path> nearest_applications_directory(
+    fs::path cursor) {
+    for (int depth = 0; depth < 8 && !cursor.empty(); ++depth) {
+        const fs::path candidate = cursor / L"Applications";
+        std::error_code error;
+        if (fs::is_directory(candidate, error)) {
+            return candidate;
+        }
+        const fs::path parent = cursor.parent_path();
+        if (parent == cursor) {
+            break;
+        }
+        cursor = parent;
+    }
+    return std::nullopt;
+}
+
+void add_unique_catalog_directory(
+    std::vector<fs::path>& directories,
+    const fs::path& candidate,
+    const fs::path& canonical) {
+    std::error_code error;
+    if (!fs::is_directory(candidate, error)) {
+        return;
+    }
+    const std::wstring normalized =
+        launchpad::lowercase(
+            candidate.lexically_normal().wstring());
+    if (normalized ==
+        launchpad::lowercase(
+            canonical.lexically_normal().wstring())) {
+        return;
+    }
+    const bool duplicate = std::ranges::any_of(
+        directories,
+        [&normalized](const fs::path& existing) {
+            return launchpad::lowercase(
+                       existing.lexically_normal().wstring()) ==
+                normalized;
+        });
+    if (!duplicate) {
+        directories.push_back(candidate);
+    }
+}
+
+std::vector<fs::path> legacy_applications_directories(
+    const fs::path& canonical,
+    const std::optional<fs::path>& local_app_data) {
+    std::vector<fs::path> directories;
+    if (local_app_data) {
+        add_unique_catalog_directory(
+            directories,
+            *local_app_data /
+                kCatalogDirectoryName /
+                L"Applications",
+            canonical);
+        add_unique_catalog_directory(
+            directories,
+            *local_app_data /
+                L"Programs" /
+                L"Windows Launchpad" /
+                L"Applications",
+            canonical);
+    }
+    if (const auto desktop =
+            desktop_applications_directory()) {
+        add_unique_catalog_directory(
+            directories,
+            *desktop,
+            canonical);
+    }
+    if (const auto executable = executable_directory()) {
+        if (const auto nearest =
+                nearest_applications_directory(*executable)) {
+            add_unique_catalog_directory(
+                directories,
+                *nearest,
+                canonical);
+        }
+    }
+    std::error_code current_error;
+    if (!current_error) {
+        const fs::path current = fs::current_path(current_error);
+        if (!current_error) {
+            if (const auto nearest =
+                    nearest_applications_directory(current)) {
+                add_unique_catalog_directory(
+                    directories,
+                    *nearest,
+                    canonical);
+            }
+        }
+    }
+    return directories;
+}
+
+bool copy_catalog_apps(
+    const fs::path& source,
+    const fs::path& destination,
+    bool overwrite_existing = false) {
+    std::error_code error;
+    fs::recursive_directory_iterator iterator(
+        source,
+        fs::directory_options::skip_permission_denied,
+        error);
+    if (error) {
+        return false;
+    }
+    const fs::recursive_directory_iterator end;
+    bool succeeded = true;
+    while (iterator != end) {
+        if (!error && iterator->is_regular_file(error)) {
+            const fs::path source_path = iterator->path();
+            if (launchpad::is_supported_app_extension(
+                    source_path.extension().wstring())) {
+                error.clear();
+                const fs::path relative =
+                    fs::relative(source_path, source, error);
+                if (!error &&
+                    !relative.empty() &&
+                    !relative.is_absolute()) {
+                    const fs::path destination_path =
+                        destination / relative;
+                    fs::create_directories(
+                        destination_path.parent_path(),
+                        error);
+                    error.clear();
+                    fs::copy_file(
+                        source_path,
+                        destination_path,
+                        overwrite_existing
+                            ? fs::copy_options::overwrite_existing
+                            : fs::copy_options::skip_existing,
+                        error);
+                    if (error) {
+                        succeeded = false;
+                    }
+                }
+            }
+        }
+        error.clear();
+        iterator.increment(error);
+        if (error) {
+            return false;
+        }
+    }
+    return succeeded;
+}
+
+CatalogSetup prepare_applications_catalog() {
+    const std::optional<fs::path> local_app_data =
+        local_app_data_directory();
+    if (!local_app_data) {
+        std::error_code error;
+        fs::path fallback = fs::current_path(error) / L"Applications";
+        if (error) {
+            fallback = L"Applications";
+        }
+        fs::create_directories(fallback, error);
+        return CatalogSetup{
+            .applications_directory = fallback,
+            .layout_path =
+                fallback.parent_path() /
+                L"LaunchpadLayout.store",
+        };
+    }
+
+    const fs::path catalog_root =
+        *local_app_data / kCatalogDirectoryName;
+    std::error_code catalog_error;
+    fs::create_directories(catalog_root, catalog_error);
+
+    const fs::path applications =
+        catalog_root / L"Applications";
+    std::error_code create_error;
+    fs::create_directories(applications, create_error);
+
+    if (catalog_error || create_error) {
+        if (const auto executable = executable_directory()) {
+            if (const auto nearest =
+                    nearest_applications_directory(*executable)) {
+                return CatalogSetup{
+                    .applications_directory = *nearest,
+                    .layout_path =
+                        nearest->parent_path() /
+                        L"LaunchpadLayout.store",
+                };
+            }
+        }
+    }
+
+    const fs::path marker =
+        catalog_root / kCatalogMarkerName;
+
+    CatalogSetup setup{
+        .applications_directory = applications,
+        .layout_path =
+            catalog_root / L"LaunchpadLayout.store",
+        .marker_path = marker,
+    };
+    setup.needs_initialization =
+        !catalog_marker_matches(marker, applications);
+    if (!setup.needs_initialization) {
+        return setup;
+    }
+
+    bool authoritative_catalog_found = false;
+    if (const auto previous_catalog =
+            catalog_marker_applications_directory(marker);
+        previous_catalog &&
+        launchpad::lowercase(
+            previous_catalog->filename().wstring()) ==
+            L"launchpad applications") {
+        setup.legacy_applications.push_back(
+            *previous_catalog);
+        std::error_code previous_error;
+        if (fs::is_directory(
+                *previous_catalog,
+                previous_error) &&
+            !previous_error) {
+            authoritative_catalog_found = true;
+            setup.migration_succeeded =
+                copy_catalog_apps(
+                    *previous_catalog,
+                    applications,
+                    true);
+        }
+    }
+    if (!authoritative_catalog_found) {
+        const std::vector<fs::path> legacy_directories =
+            legacy_applications_directories(
+                applications,
+                local_app_data);
+        for (const fs::path& legacy : legacy_directories) {
+            const std::wstring normalized =
+                launchpad::lowercase(
+                    legacy.lexically_normal().wstring());
+            const bool already_added =
+                std::ranges::any_of(
+                    setup.legacy_applications,
+                    [&normalized](const fs::path& existing) {
+                        return launchpad::lowercase(
+                                   existing.lexically_normal()
+                                       .wstring()) ==
+                            normalized;
+                    });
+            if (!already_added) {
+                setup.legacy_applications.push_back(legacy);
+            }
+            setup.migration_succeeded =
+                copy_catalog_apps(legacy, applications) &&
+                setup.migration_succeeded;
+        }
+    }
+
+    std::error_code layout_error;
+    if (!fs::is_regular_file(setup.layout_path, layout_error)) {
+        for (const fs::path& legacy :
+             setup.legacy_applications) {
+            const fs::path candidate =
+                legacy.parent_path() /
+                L"LaunchpadLayout.store";
+            layout_error.clear();
+            if (fs::is_regular_file(candidate, layout_error)) {
+                setup.legacy_layout_path = candidate;
+                setup.legacy_layout_applications = legacy;
+                break;
+            }
+        }
+    }
+    return setup;
+}
+
+bool remap_catalog_path(
+    std::wstring& value,
+    const fs::path& source,
+    const fs::path& destination) {
+    const std::wstring original =
+        fs::path(value).lexically_normal().wstring();
+    std::wstring source_prefix =
+        source.lexically_normal().wstring();
+    if (!source_prefix.empty() &&
+        source_prefix.back() != L'\\' &&
+        source_prefix.back() != L'/') {
+        source_prefix.push_back(fs::path::preferred_separator);
+    }
+    const std::wstring normalized_original =
+        launchpad::lowercase(original);
+    const std::wstring normalized_prefix =
+        launchpad::lowercase(source_prefix);
+    if (!normalized_original.starts_with(normalized_prefix)) {
+        return false;
+    }
+    const fs::path relative(
+        original.substr(source_prefix.size()));
+    value = (destination / relative)
+        .lexically_normal()
+        .wstring();
+    return true;
+}
+
+bool remap_catalog_layout(
+    launchpad::LayoutDocument& layout,
+    const fs::path& source,
+    const fs::path& destination) {
+    bool changed = false;
+    for (launchpad::LayoutItem& item : layout.items()) {
+        if (item.kind == launchpad::LayoutItemKind::app) {
+            changed =
+                remap_catalog_path(
+                    item.app_path,
+                    source,
+                    destination) ||
+                changed;
+            continue;
+        }
+        if (item.kind != launchpad::LayoutItemKind::folder) {
+            continue;
+        }
+        for (std::wstring& child : item.children) {
+            changed =
+                remap_catalog_path(
+                    child,
+                    source,
+                    destination) ||
+                changed;
+        }
+    }
+    return changed;
+}
+
+bool scan_applications_directory(
     const fs::path& root,
     std::vector<AppEntry>& apps,
-    std::unordered_set<std::wstring>& names) {
+    std::unordered_set<std::wstring>& paths) {
     std::error_code error;
+    if (!fs::is_directory(root, error) || error) {
+        return false;
+    }
     fs::recursive_directory_iterator iterator(
         root,
         fs::directory_options::skip_permission_denied,
         error);
+    if (error) {
+        return false;
+    }
     const fs::recursive_directory_iterator end;
     while (iterator != end) {
-        if (!error && iterator->is_regular_file(error)) {
+        if (iterator->is_regular_file(error)) {
             const fs::path path = iterator->path();
             if (launchpad::is_supported_app_extension(
                     path.extension().wstring())) {
                 add_unique_app(
                     apps,
-                    names,
+                    paths,
                     path.stem().wstring(),
                     path.wstring());
             }
         }
+        if (error) {
+            return false;
+        }
         error.clear();
         iterator.increment(error);
+        if (error) {
+            return false;
+        }
     }
+    return true;
 }
 
-std::vector<AppEntry> load_apps(const fs::path& applications_directory) {
-    std::vector<AppEntry> apps;
-    std::unordered_set<std::wstring> names;
-    scan_applications_directory(applications_directory, apps, names);
+bool load_apps(
+    const fs::path& applications_directory,
+    std::vector<AppEntry>& apps) {
+    apps.clear();
+    std::unordered_set<std::wstring> paths;
+    if (!scan_applications_directory(
+            applications_directory,
+            apps,
+            paths)) {
+        apps.clear();
+        return false;
+    }
 
     std::ranges::sort(
         apps,
         [](const AppEntry& left, const AppEntry& right) {
-            return launchpad::lowercase(left.name) <
+            const std::wstring left_name =
+                launchpad::lowercase(left.name);
+            const std::wstring right_name =
                 launchpad::lowercase(right.name);
+            if (left_name != right_name) {
+                return left_name < right_name;
+            }
+            return launchpad::lowercase(left.path) <
+                launchpad::lowercase(right.path);
         });
-    return apps;
+    return true;
+}
+
+std::optional<std::uint64_t> applications_directory_signature(
+    const fs::path& applications_directory) {
+    std::vector<std::wstring> entries;
+    std::error_code error;
+    if (!fs::is_directory(applications_directory, error) || error) {
+        return std::nullopt;
+    }
+    fs::recursive_directory_iterator iterator(
+        applications_directory,
+        fs::directory_options::skip_permission_denied,
+        error);
+    if (error) {
+        return std::nullopt;
+    }
+    const fs::recursive_directory_iterator end;
+    while (iterator != end) {
+        if (iterator->is_regular_file(error)) {
+            const fs::path path = iterator->path();
+            if (launchpad::is_supported_app_extension(
+                    path.extension().wstring())) {
+                error.clear();
+                fs::path relative = fs::relative(
+                    path,
+                    applications_directory,
+                    error);
+                if (error) {
+                    relative = path.filename();
+                    error.clear();
+                }
+                const std::uintmax_t size =
+                    iterator->file_size(error);
+                if (error) {
+                    return std::nullopt;
+                }
+                const fs::file_time_type modified =
+                    iterator->last_write_time(error);
+                if (error) {
+                    return std::nullopt;
+                }
+                const auto modified_count =
+                    modified.time_since_epoch().count();
+                entries.push_back(
+                    launchpad::lowercase(
+                        relative.lexically_normal().wstring()) +
+                    L"\n" +
+                    std::to_wstring(size) +
+                    L"\n" +
+                    std::to_wstring(modified_count));
+            }
+        }
+        if (error) {
+            return std::nullopt;
+        }
+        error.clear();
+        iterator.increment(error);
+        if (error) {
+            return std::nullopt;
+        }
+    }
+    std::ranges::sort(entries);
+
+    constexpr std::uint64_t offset = 1469598103934665603ULL;
+    constexpr std::uint64_t prime = 1099511628211ULL;
+    std::uint64_t signature = offset;
+    for (const std::wstring& entry : entries) {
+        for (const wchar_t character : entry) {
+            signature ^=
+                static_cast<std::uint64_t>(
+                    static_cast<std::uint32_t>(character));
+            signature *= prime;
+        }
+        signature ^= 0xFFU;
+        signature *= prime;
+    }
+    return signature;
 }
 
 class ApplicationsDropTarget final : public IDropTarget {
@@ -1089,13 +1714,68 @@ public:
         diagnostics_enabled_ =
             has_command_line_switch(L"--diagnostics");
         animations_enabled_ = query_animations_enabled();
-        applications_directory_ = find_applications_directory();
-        layout_path_ =
-            applications_directory_.parent_path() /
-            L"LaunchpadLayout.store";
-        apps_ = load_apps(applications_directory_);
-        launchpad::load_layout(layout_path_, layout_);
-        reconcile_layout();
+        const CatalogSetup catalog =
+            prepare_applications_catalog();
+        applications_directory_ =
+            catalog.applications_directory;
+        layout_path_ = catalog.layout_path;
+        const bool applications_loaded =
+            load_apps(applications_directory_, apps_);
+        const bool loaded_current_layout =
+            launchpad::load_layout(layout_path_, layout_);
+        bool loaded_legacy_layout = false;
+        if (!loaded_current_layout &&
+            !catalog.legacy_layout_path.empty()) {
+            loaded_legacy_layout = launchpad::load_layout(
+                catalog.legacy_layout_path,
+                layout_);
+        }
+        bool layout_remapped = false;
+        if (loaded_current_layout || loaded_legacy_layout) {
+            if (loaded_legacy_layout) {
+                layout_remapped =
+                    remap_catalog_layout(
+                        layout_,
+                        catalog.legacy_layout_applications,
+                        applications_directory_) ||
+                    layout_remapped;
+            }
+            for (const fs::path& legacy :
+                 catalog.legacy_applications) {
+                layout_remapped =
+                    remap_catalog_layout(
+                        layout_,
+                        legacy,
+                        applications_directory_) ||
+                    layout_remapped;
+            }
+        }
+        bool layout_saved = true;
+        const bool catalog_ready =
+            applications_loaded &&
+            (!catalog.needs_initialization ||
+             catalog.migration_succeeded);
+        if (catalog_ready) {
+            layout_saved = reconcile_layout();
+            if (loaded_legacy_layout || layout_remapped) {
+                layout_saved =
+                    save_layout_state() &&
+                    layout_saved;
+            }
+        }
+        if (catalog.needs_initialization &&
+            catalog.migration_succeeded &&
+            catalog_ready &&
+            layout_saved) {
+            mark_catalog_initialized(
+                catalog.marker_path,
+                applications_directory_);
+        }
+        const auto initial_signature =
+            applications_directory_signature(
+                applications_directory_);
+        applications_signature_ =
+            initial_signature.value_or(0);
         rebuild_filter();
 
         if (FAILED(D2D1CreateFactory(
@@ -1243,8 +1923,13 @@ public:
                 external_drop_target_.Reset();
             }
         }
+        SetTimer(
+            hwnd_,
+            kApplicationsWatchTimer,
+            kApplicationsWatchIntervalMs,
+            nullptr);
 
-        preload_icons();
+        preload_visible_icons();
         if (background_mode_) {
             RegisterHotKey(
                 hwnd_,
@@ -1432,6 +2117,10 @@ private:
             if (wparam == kExternalDropRescanTimer) {
                 KillTimer(hwnd_, kExternalDropRescanTimer);
                 finish_external_drop_rescan();
+                return 0;
+            }
+            if (wparam == kApplicationsWatchTimer) {
+                refresh_apps_if_changed();
                 return 0;
             }
             if (!frame_timer_ && wparam == kAnimationTimer) {
@@ -1919,6 +2608,7 @@ private:
             return 0;
         case WM_DESTROY:
             KillTimer(hwnd_, kExternalDropRescanTimer);
+            KillTimer(hwnd_, kApplicationsWatchTimer);
             pending_external_drop_.reset();
             if (external_drop_target_registered_) {
                 RevokeDragDrop(hwnd_);
@@ -2047,7 +2737,7 @@ private:
         return available;
     }
 
-    void reconcile_layout() {
+    bool reconcile_layout() {
         app_by_path_.clear();
         for (std::size_t index = 0; index < apps_.size(); ++index) {
             app_by_path_.emplace(
@@ -2056,8 +2746,9 @@ private:
         }
         const auto available = available_apps();
         if (layout_.reconcile(available)) {
-            save_layout_state();
+            return save_layout_state();
         }
+        return true;
     }
 
     std::size_t app_index_for_path(std::wstring_view path) const {
@@ -2179,6 +2870,48 @@ private:
             ensure_icon(app);
         }
         icons_pending_ = false;
+    }
+
+    void preload_visible_icons() {
+        if (!ensure_device_resources()) {
+            return;
+        }
+        const auto [first, last] =
+            visible_page_range(current_page_);
+        for (std::size_t position = first;
+             position < last;
+             ++position) {
+            if (position >= visible_items_.size()) {
+                break;
+            }
+            const VisibleItem& visible =
+                visible_items_[position];
+            if (AppEntry* app = app_for_visible(visible)) {
+                ensure_icon(*app);
+                continue;
+            }
+            if (visible.kind != VisibleItemKind::folder ||
+                visible.layout_index >= layout_.items().size()) {
+                continue;
+            }
+            const launchpad::LayoutItem& folder =
+                layout_.items()[visible.layout_index];
+            for (std::size_t child = 0;
+                 child < folder.children.size();
+                 ++child) {
+                const std::size_t app_index =
+                    app_index_for_path(folder.children[child]);
+                if (app_index != kNoPage) {
+                    ensure_icon(apps_[app_index]);
+                }
+            }
+        }
+        icons_pending_ = std::ranges::any_of(
+            apps_,
+            [](const AppEntry& app) {
+                return !app.icon &&
+                    !app.icon_attempted;
+            });
     }
 
     void capture_background(const RECT& bounds) {
@@ -3003,10 +3736,10 @@ private:
                     .extension()
                     .wstring()) == L".exe";
         const std::wstring body = executable_file
-            ? L"Файл приложения будет перемещён в Корзину "
-                L"Windows."
-            : L"Ярлык будет перемещён в Корзину Windows. "
-                L"Сама программа останется на компьютере.";
+            ? L"Сам файл приложения будет удалён.\n"
+                L"Приложение может перестать запускаться."
+            : L"Ярлык будет удалён из Launchpad.\n"
+                L"Программа останется на компьютере.";
         const D2D1_RECT_F body_bounds = D2D1::RectF(
             geometry.panel.rect.left + 42.0F,
             geometry.panel.rect.top + 68.0F,
@@ -3626,20 +4359,22 @@ private:
                 interactions_ready) {
                 const D2D1_RECT_F delete_bounds =
                     draw_delete_button(icon_rect, item_opacity);
-                folder_delete_hit_regions_.push_back(HitRegion{
-                    .bounds = delete_bounds,
-                    .icon_bounds = icon_rect,
-                    .visible_position = position,
-                });
+                if (!folder_drag_reflow_active_) {
+                    folder_delete_hit_regions_.push_back(HitRegion{
+                        .bounds = delete_bounds,
+                        .icon_bounds = icon_rect,
+                        .visible_position = position,
+                    });
+                }
             }
             white_brush_->SetOpacity(
                 0.94F * content_visibility *
                 (drag_source ? 0.05F : 1.0F));
             const D2D1_RECT_F label = D2D1::RectF(
-                center_x - cell_width * 0.46F,
-                center_y + half + 8.0F,
-                center_x + cell_width * 0.46F,
-                center_y + half + 32.0F);
+                animated_center_x - cell_width * 0.46F,
+                animated_center_y + half + 8.0F,
+                animated_center_x + cell_width * 0.46F,
+                animated_center_y + half + 32.0F);
             render_target_->DrawTextW(
                 app.name.c_str(),
                 static_cast<UINT32>(app.name.size()),
@@ -3647,10 +4382,11 @@ private:
                 label,
                 white_brush_.Get(),
                 D2D1_DRAW_TEXT_OPTIONS_CLIP);
-            if (interactions_ready) {
+            if (interactions_ready &&
+                !folder_drag_reflow_active_) {
                 folder_hit_regions_.push_back(HitRegion{
-                    .bounds = target_icon_rect,
-                    .icon_bounds = target_icon_rect,
+                    .bounds = icon_rect,
+                    .icon_bounds = icon_rect,
                     .visible_position = position,
                 });
             }
@@ -4609,8 +5345,8 @@ private:
         if (visible_items_.empty()) {
             white_brush_->SetOpacity(0.72F * visibility);
             const std::wstring message = apps_.empty()
-                ? L"Папка Applications пуста\n"
-                  L"Добавьте ярлыки или нажмите Ctrl+O"
+                ? L"Папка Launchpad Applications пуста\n"
+                  L"Переместите в неё ярлыки .lnk или нажмите Ctrl+O"
                 : L"Приложения не найдены";
             render_target_->DrawTextW(
                 message.c_str(),
@@ -5046,6 +5782,15 @@ private:
             folder_drag_active_ || folder_drag_candidate_) {
             return true;
         }
+        if (key == VK_F5) {
+            rescan_apps();
+            return true;
+        }
+        if (key == L'O' &&
+            (GetKeyState(VK_CONTROL) & 0x8000) != 0) {
+            open_applications_directory();
+            return true;
+        }
         if (open_folder_index_ != kNoPage) {
             if (folder_name_editing_) {
                 switch (key) {
@@ -5156,9 +5901,6 @@ private:
             }
             request_close();
             return true;
-        case VK_F5:
-            rescan_apps();
-            return true;
         case VK_RETURN:
             launch_selected();
             return true;
@@ -5213,12 +5955,6 @@ private:
                 InvalidateRect(hwnd_, nullptr, FALSE);
             }
             return true;
-        case L'O':
-            if ((GetKeyState(VK_CONTROL) & 0x8000) != 0) {
-                open_applications_directory();
-                return true;
-            }
-            return false;
         default:
             return false;
         }
@@ -6778,10 +7514,159 @@ private:
             .path = pending_delete_path_,
         };
         const std::size_t page = pending_delete_page_;
-        dismiss_delete_confirmation();
-        if (recycle_app_file(pending)) {
-            rescan_apps(page);
+        const bool deleting_from_folder =
+            open_folder_index_ < layout_.items().size() &&
+            layout_.items()[open_folder_index_].kind ==
+                launchpad::LayoutItemKind::folder;
+        const bool animate_root_reflow =
+            animations_enabled_ &&
+            !deleting_from_folder &&
+            !page_transition_active_;
+        std::unordered_map<std::wstring, D2D1_POINT_2F>
+            folder_reflow_from_centers;
+        if (deleting_from_folder) {
+            root_reflow_animation_active_ = false;
+            folder_drag_reflow_active_ = false;
+            folder_drag_reflow_from_centers_.clear();
+            const launchpad::LayoutItem& folder =
+                layout_.items()[open_folder_index_];
+            for (const HitRegion& region : folder_hit_regions_) {
+                if (region.visible_position >=
+                    folder.children.size()) {
+                    continue;
+                }
+                folder_reflow_from_centers.insert_or_assign(
+                    launchpad::lowercase(
+                        folder.children[region.visible_position]),
+                    D2D1::Point2F(
+                        (region.icon_bounds.left +
+                         region.icon_bounds.right) *
+                            0.5F,
+                        (region.icon_bounds.top +
+                         region.icon_bounds.bottom) *
+                            0.5F));
+            }
+            root_reflow_from_centers_.clear();
+        } else if (animate_root_reflow) {
+            root_reflow_animation_active_ = false;
+            capture_root_reflow_positions();
+        } else {
+            root_reflow_animation_active_ = false;
+            root_reflow_from_centers_.clear();
         }
+        dismiss_delete_confirmation();
+        if (!recycle_app_file(pending)) {
+            root_reflow_animation_active_ = false;
+            root_reflow_from_centers_.clear();
+            folder_drag_reflow_active_ = false;
+            folder_drag_reflow_from_centers_.clear();
+            return;
+        }
+        if (!rescan_apps(page, false) ||
+            app_index_for_path(pending.path) != kNoPage) {
+            root_reflow_animation_active_ = false;
+            root_reflow_from_centers_.clear();
+            folder_drag_reflow_active_ = false;
+            folder_drag_reflow_from_centers_.clear();
+            return;
+        }
+
+        LARGE_INTEGER animation_counter{};
+        QueryPerformanceCounter(&animation_counter);
+        if (deleting_from_folder) {
+            folder_drag_reflow_from_centers_ =
+                std::move(folder_reflow_from_centers);
+            folder_drag_reflow_origin_ =
+                animation_counter.QuadPart;
+            folder_drag_reflow_active_ =
+                animations_enabled_ &&
+                open_folder_index_ < layout_.items().size() &&
+                !folder_drag_reflow_from_centers_.empty();
+            if (!folder_drag_reflow_active_) {
+                folder_drag_reflow_from_centers_.clear();
+            }
+        } else {
+            const bool has_surviving_item =
+                std::ranges::any_of(
+                    visible_items_,
+                    [this](const VisibleItem& visible) {
+                        return root_reflow_from_centers_.contains(
+                            root_visual_key(visible));
+                    });
+            root_reflow_animation_origin_ =
+                animation_counter.QuadPart;
+            root_reflow_animation_active_ =
+                animate_root_reflow &&
+                current_page_ == page &&
+                has_surviving_item;
+            if (!root_reflow_animation_active_) {
+                root_reflow_from_centers_.clear();
+            }
+        }
+        InvalidateRect(hwnd_, nullptr, FALSE);
+    }
+
+    bool move_app_to_quarantine(const fs::path& path) {
+        const fs::path quarantine =
+            layout_path_.parent_path() /
+            L"Removed Items";
+        std::error_code error;
+        fs::create_directories(quarantine, error);
+        if (error) {
+            return false;
+        }
+
+        fs::path destination =
+            quarantine / path.filename();
+        for (int suffix = 1;
+             fs::exists(destination, error) && !error;
+             ++suffix) {
+            destination =
+                quarantine /
+                (path.stem().wstring() +
+                 L" (" + std::to_wstring(suffix) + L")" +
+                 path.extension().wstring());
+        }
+        if (error) {
+            return false;
+        }
+
+        fs::rename(path, destination, error);
+        if (!error) {
+            SHChangeNotify(
+                SHCNE_RENAMEITEM,
+                SHCNF_PATHW,
+                path.c_str(),
+                destination.c_str());
+            return true;
+        }
+
+        error.clear();
+        fs::copy_file(
+            path,
+            destination,
+            fs::copy_options::none,
+            error);
+        if (error) {
+            return false;
+        }
+        error.clear();
+        if (!fs::remove(path, error) || error) {
+            std::error_code cleanup_error;
+            fs::remove(destination, cleanup_error);
+            return false;
+        }
+        SHChangeNotify(
+            SHCNE_DELETE,
+            SHCNF_PATHW,
+            path.c_str(),
+            nullptr);
+        SHChangeNotify(
+            SHCNE_CREATE,
+            SHCNF_PATHW,
+            destination.c_str(),
+            nullptr);
+        return true;
     }
 
     bool recycle_app_file(const AppEntry& app) {
@@ -6803,6 +7688,9 @@ private:
             CLSCTX_INPROC_SERVER,
             IID_PPV_ARGS(operation.ReleaseAndGetAddressOf()));
         if (SUCCEEDED(result)) {
+            result = operation->SetOwnerWindow(hwnd_);
+        }
+        if (SUCCEEDED(result)) {
             result = operation->SetOperationFlags(
                 FOF_ALLOWUNDO |
                 FOF_NOCONFIRMATION |
@@ -6823,16 +7711,37 @@ private:
                 nullptr);
         }
         if (SUCCEEDED(result)) {
-            result = operation->PerformOperations();
+            const HRESULT perform_result =
+                operation->PerformOperations();
+            BOOL aborted = FALSE;
+            const HRESULT aborted_result =
+                operation->GetAnyOperationsAborted(&aborted);
+            result = FAILED(perform_result)
+                ? perform_result
+                : aborted_result;
+            if (SUCCEEDED(result) && aborted) {
+                result = E_ABORT;
+            }
         }
-        BOOL aborted = FALSE;
-        if (SUCCEEDED(result)) {
-            result = operation->GetAnyOperationsAborted(&aborted);
+
+        std::error_code exists_error;
+        const bool file_still_exists =
+            fs::exists(path, exists_error);
+        if (!exists_error && !file_still_exists) {
+            return true;
         }
-        if (FAILED(result) || aborted) {
+        if (move_app_to_quarantine(path)) {
+            return true;
+        }
+        if (FAILED(result) ||
+            file_still_exists ||
+            exists_error) {
+            const std::wstring code = result == E_ABORT
+                ? L"E_ABORT (0x80004004)"
+                : std::to_wstring(static_cast<long>(result));
             const std::wstring message =
-                L"Не удалось переместить объект в Корзину.\nКод: " +
-                std::to_wstring(static_cast<long>(result));
+                L"Не удалось убрать объект из Launchpad.\nКод: " +
+                code;
             MessageBoxW(
                 hwnd_,
                 message.c_str(),
@@ -6840,7 +7749,7 @@ private:
                 MB_OK | MB_ICONERROR);
             return false;
         }
-        return true;
+        return false;
     }
 
     void delete_root_app(std::size_t visible_position) {
@@ -6985,9 +7894,13 @@ private:
         const std::size_t target_page =
             pending.target_page;
 
-        const std::vector<AppEntry> discovered_apps =
-            load_apps(applications_directory_);
+        std::vector<AppEntry> discovered_apps;
+        const bool scan_succeeded =
+            load_apps(
+                applications_directory_,
+                discovered_apps);
         const bool new_file_visible =
+            scan_succeeded &&
             std::ranges::any_of(
                 discovered_apps,
                 [&pending](const AppEntry& app) {
@@ -7010,7 +7923,7 @@ private:
             return;
         }
 
-        rescan_apps(target_page);
+        rescan_apps(target_page, false);
         std::vector<std::wstring> added_paths;
         for (const AppEntry& app : apps_) {
             if (!pending.previous_paths.contains(
@@ -7106,9 +8019,17 @@ private:
         InvalidateRect(hwnd_, nullptr, FALSE);
     }
 
-    void rescan_apps(std::size_t preferred_page = kNoPage) {
+    bool rescan_apps(
+        std::size_t preferred_page = kNoPage,
+        bool reveal_new_apps = true) {
         if (preferred_page == kNoPage) {
             preferred_page = current_page_;
+        }
+        std::unordered_set<std::wstring> previous_paths;
+        previous_paths.reserve(apps_.size());
+        for (const AppEntry& app : apps_) {
+            previous_paths.insert(
+                launchpad::lowercase(app.path));
         }
         const bool folder_was_open =
             open_folder_index_ != kNoPage;
@@ -7123,7 +8044,20 @@ private:
                     launchpad::lowercase(path));
             }
         }
-        apps_ = load_apps(applications_directory_);
+        std::vector<AppEntry> rescanned_apps;
+        if (!load_apps(
+                applications_directory_,
+                rescanned_apps)) {
+            return false;
+        }
+        apps_ = std::move(rescanned_apps);
+        std::vector<std::wstring> added_paths;
+        for (const AppEntry& app : apps_) {
+            if (!previous_paths.contains(
+                    launchpad::lowercase(app.path))) {
+                added_paths.push_back(app.path);
+            }
+        }
         reconcile_layout();
         if (folder_was_open) {
             std::size_t resolved_folder = kNoPage;
@@ -7169,6 +8103,124 @@ private:
         preload_icons();
         selection_visible_ = false;
         rebuild_filter(preferred_page);
+        if (reveal_new_apps &&
+            !folder_was_open &&
+            !added_paths.empty()) {
+            const std::size_t position =
+                visible_position_for_root_app(
+                    added_paths.front());
+            if (position != kNoPage) {
+                const std::size_t page =
+                    visible_page_for_position(position);
+                if (page != current_page_) {
+                    rebuild_filter(page);
+                }
+                selected_position_ =
+                    visible_position_for_root_app(
+                        added_paths.front());
+                selection_visible_ = false;
+            }
+        }
+        if (const auto signature =
+                applications_directory_signature(
+                    applications_directory_)) {
+            applications_signature_ = *signature;
+        }
+        pending_removal_signature_.reset();
+        pending_removal_checks_ = 0;
+        InvalidateRect(hwnd_, nullptr, FALSE);
+        return true;
+    }
+
+    void refresh_apps_if_changed() {
+        if (!hwnd_ ||
+            !IsWindowVisible(hwnd_) ||
+            !intro_complete_ ||
+            closing_ ||
+            delete_confirmation_active_ ||
+            pending_external_drop_ ||
+            drag_active_ ||
+            drag_candidate_ ||
+            folder_drag_active_ ||
+            folder_drag_candidate_ ||
+            page_drag_active_ ||
+            page_transition_active_ ||
+            folder_animation_active_ ||
+            folder_closing_ ||
+            folder_drop_animation_active_ ||
+            root_reflow_animation_active_ ||
+            root_drag_reflow_active_ ||
+            folder_drag_reflow_active_) {
+            return;
+        }
+        const auto signature =
+            applications_directory_signature(
+                applications_directory_);
+        if (!signature) {
+            return;
+        }
+        if (*signature == applications_signature_) {
+            pending_removal_signature_.reset();
+            pending_removal_checks_ = 0;
+            return;
+        }
+
+        std::vector<AppEntry> discovered_apps;
+        if (!load_apps(
+                applications_directory_,
+                discovered_apps)) {
+            return;
+        }
+        std::unordered_set<std::wstring> current_paths;
+        std::unordered_set<std::wstring> discovered_paths;
+        current_paths.reserve(apps_.size());
+        discovered_paths.reserve(discovered_apps.size());
+        for (const AppEntry& app : apps_) {
+            current_paths.insert(
+                launchpad::lowercase(app.path));
+        }
+        for (const AppEntry& app : discovered_apps) {
+            discovered_paths.insert(
+                launchpad::lowercase(app.path));
+        }
+        const bool has_additions =
+            std::ranges::any_of(
+                discovered_paths,
+                [&current_paths](
+                    const std::wstring& path) {
+                    return !current_paths.contains(path);
+                });
+        const bool has_removals =
+            std::ranges::any_of(
+                current_paths,
+                [&discovered_paths](
+                    const std::wstring& path) {
+                    return !discovered_paths.contains(path);
+                });
+
+        if (!has_additions && !has_removals) {
+            applications_signature_ = *signature;
+            pending_removal_signature_.reset();
+            pending_removal_checks_ = 0;
+            return;
+        }
+        if (!has_additions && has_removals) {
+            if (!pending_removal_signature_ ||
+                *pending_removal_signature_ != *signature) {
+                pending_removal_signature_ = *signature;
+                pending_removal_checks_ = 1;
+                return;
+            }
+            ++pending_removal_checks_;
+            if (pending_removal_checks_ <
+                kApplicationsRemovalConfirmations) {
+                return;
+            }
+        } else {
+            pending_removal_signature_.reset();
+            pending_removal_checks_ = 0;
+        }
+        rescan_apps(current_page_);
     }
 
     void open_applications_directory() {
@@ -7186,6 +8238,8 @@ private:
     void show_launchpad() {
         const RECT bounds = active_monitor_bounds();
         const bool was_hidden = !IsWindowVisible(hwnd_);
+        const int width = bounds.right - bounds.left;
+        const int height = bounds.bottom - bounds.top;
         if (was_hidden) {
             capture_background(bounds);
             if (!search_.empty()) {
@@ -7202,16 +8256,60 @@ private:
         set_search_focused(false, false);
         close_start_visibility_ = 1.0F;
         reset_page_motion();
-        SetWindowPos(
-            hwnd_,
-            HWND_TOP,
-            bounds.left,
-            bounds.top,
-            bounds.right - bounds.left,
-            bounds.bottom - bounds.top,
-            SWP_SHOWWINDOW);
+        if (was_hidden) {
+            SetWindowPos(
+                hwnd_,
+                nullptr,
+                bounds.left,
+                bounds.top,
+                width,
+                height,
+                SWP_NOACTIVATE | SWP_NOZORDER);
+        }
         reset_animation_clock();
         intro_complete_ = !animations_enabled_;
+        if (was_hidden) {
+            const BOOL cloak = TRUE;
+            const bool cloak_enabled =
+                SUCCEEDED(DwmSetWindowAttribute(
+                    hwnd_,
+                    DWMWA_CLOAK,
+                    &cloak,
+                    sizeof(cloak)));
+            SetWindowPos(
+                hwnd_,
+                HWND_TOP,
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE |
+                    SWP_NOACTIVATE | SWP_SHOWWINDOW);
+            RedrawWindow(
+                hwnd_,
+                nullptr,
+                nullptr,
+                RDW_INVALIDATE | RDW_UPDATENOW |
+                    RDW_NOERASE);
+            reset_animation_clock();
+            if (cloak_enabled) {
+                const BOOL uncloak = FALSE;
+                DwmSetWindowAttribute(
+                    hwnd_,
+                    DWMWA_CLOAK,
+                    &uncloak,
+                    sizeof(uncloak));
+            }
+        } else {
+            SetWindowPos(
+                hwnd_,
+                HWND_TOP,
+                bounds.left,
+                bounds.top,
+                width,
+                height,
+                SWP_SHOWWINDOW);
+        }
         start_frame_pump();
         SetForegroundWindow(hwnd_);
         SetFocus(hwnd_);
@@ -7730,6 +8828,9 @@ private:
     std::wstring pending_delete_path_;
     fs::path applications_directory_;
     fs::path layout_path_;
+    std::uint64_t applications_signature_ = 0;
+    std::optional<std::uint64_t> pending_removal_signature_;
+    int pending_removal_checks_ = 0;
     std::vector<AppEntry> apps_;
     launchpad::LayoutDocument layout_;
     std::unordered_map<std::wstring, std::size_t> app_by_path_;
@@ -7860,6 +8961,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     SetCurrentProcessExplicitAppUserModelID(kAppUserModelId);
     SetProcessDpiAwarenessContext(
         DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    clear_startup_feedback_cursor();
 
     const bool create_shortcuts =
         has_command_line_switch(L"--create-shortcuts");
