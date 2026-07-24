@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.23)
-project(WindowsLaunchpad VERSION 0.2.0 LANGUAGES CXX)
+project(WindowsLaunchpad VERSION 0.3.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -7,6 +7,13 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 if(NOT WIN32)
   message(FATAL_ERROR "Windows Launchpad can only be built on Windows.")
+endif()
+
+if(MSVC)
+  # Keep the release executable self-contained. The installer must work on a
+  # clean Windows account without first installing the Visual C++ runtime.
+  set(CMAKE_MSVC_RUNTIME_LIBRARY
+    "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 endif()
 
 enable_language(RC)

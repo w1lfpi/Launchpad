@@ -1,0 +1,121 @@
+name: Build Windows installer
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-installer:
+    runs-on: windows-latest
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+
+      - name: Install Inno Setup 7
+        shell: pwsh
+        run: |
+          $download = Join-Path $env:RUNNER_TEMP "innosetup-7.0.2-x64.exe"
+          Invoke-WebRequest `
+            -Uri "https://github.com/jrsoftware/issrc/releases/download/is-7_0_2/innosetup-7.0.2-x64.exe" `
+            -OutFile $download
+
+          $expectedHash = "5ad54ca3def786f8f4212552e54cc6d8d61329e2d24a1cfee0571d42c2684ff1"
+          $actualHash = (Get-FileHash $download -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actualHash -ne $expectedHash) {
+            throw "Unexpected Inno Setup installer hash: $actualHash"
+          }
+
+          $process = Start-Process `
+            -FilePath $download `
+            -ArgumentList @(
+              "/VERYSILENT",
+              "/SUPPRESSMSGBOXES",
+              "/NORESTART",
+              "/CURRENTUSER"
+            ) `
+            -Wait `
+            -PassThru
+          if ($process.ExitCode -ne 0) {
+            throw "Inno Setup installation failed: $($process.ExitCode)"
+          }
+
+      - name: Build and test installer
+        shell: pwsh
+        run: .\scripts\build-installer.ps1
+
+      - name: Smoke-test install, update, uninstall, and reinstall
+        shell: pwsh
+        run: .\scripts\verify-installer.ps1 -FullCycle
+
+      - name: Prepare release files
+        id: package
+        shell: pwsh
+        run: |
+          $cmakeText = Get-Content .\CMakeLists.txt -Raw
+          $match = [regex]::Match(
+            $cmakeText,
+            'project\s*\(\s*WindowsLaunchpad\s+VERSION\s+([0-9]+\.[0-9]+\.[0-9]+)')
+          if (-not $match.Success) {
+            throw "Could not read the project version."
+          }
+
+          $version = $match.Groups[1].Value
+          if (($env:GITHUB_REF_TYPE -eq "tag") -and
+              ($env:GITHUB_REF_NAME -ne "v$version")) {
+            throw (
+              "Tag $env:GITHUB_REF_NAME does not match project version " +
+              "$version.")
+          }
+          $setup = (Resolve-Path (
+            ".\dist\WindowsLaunchpad-{0}-Setup-x64.exe" -f $version)).Path
+          $checksum = "$setup.sha256"
+          $hash = (Get-FileHash $setup -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  $([IO.Path]::GetFileName($setup))" |
+            Set-Content -LiteralPath $checksum -Encoding ascii
+
+          "version=$version" >> $env:GITHUB_OUTPUT
+          "setup=$setup" >> $env:GITHUB_OUTPUT
+          "checksum=$checksum" >> $env:GITHUB_OUTPUT
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: WindowsLaunchpad-${{ steps.package.outputs.version }}-Setup-x64
+          path: |
+            ${{ steps.package.outputs.setup }}
+            ${{ steps.package.outputs.checksum }}
+          if-no-files-found: error
+
+      - name: Publish tagged release
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.package.outputs.version }}
+          SETUP_FILE: ${{ steps.package.outputs.setup }}
+          CHECKSUM_FILE: ${{ steps.package.outputs.checksum }}
+        run: |
+          gh release view $env:GITHUB_REF_NAME *> $null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload `
+              $env:GITHUB_REF_NAME `
+              $env:SETUP_FILE `
+              $env:CHECKSUM_FILE `
+              --clobber
+          } else {
+            gh release create `
+              $env:GITHUB_REF_NAME `
+              $env:SETUP_FILE `
+              $env:CHECKSUM_FILE `
+              --title "Windows Launchpad $env:VERSION" `
+              --generate-notes
+          }
+          if ($LASTEXITCODE -ne 0) {
+            throw "GitHub Release publishing failed."
+          }

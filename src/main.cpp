@@ -57,6 +57,7 @@ constexpr UINT_PTR kApplicationsWatchTimer = 3;
 constexpr int kGlobalHotkeyId = 1;
 constexpr UINT kShowLaunchpadMessage = WM_APP + 42;
 constexpr UINT kExternalDropCompletedMessage = WM_APP + 43;
+constexpr UINT kExitLaunchpadMessage = WM_APP + 44;
 constexpr UINT kExternalDropRescanDelayMs = 160;
 constexpr int kExternalDropRescanAttempts = 20;
 constexpr UINT kApplicationsWatchIntervalMs = 800;
@@ -2597,6 +2598,14 @@ private:
             return 0;
         case kShowLaunchpadMessage:
             show_launchpad();
+            return 0;
+        case kExitLaunchpadMessage:
+            background_mode_ = false;
+            if (IsWindowVisible(hwnd_)) {
+                request_close();
+            } else {
+                DestroyWindow(hwnd_);
+            }
             return 0;
         case kExternalDropCompletedMessage:
             begin_external_drop_rescan(
@@ -8985,8 +8994,30 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
         return succeeded ? 0 : 1;
     }
 
+    const bool shutdown_requested =
+        has_command_line_switch(L"--shutdown");
     if (HWND existing = FindWindowW(kWindowClass, nullptr)) {
-        PostMessageW(existing, kShowLaunchpadMessage, 0, 0);
+        PostMessageW(
+            existing,
+            shutdown_requested
+                ? kExitLaunchpadMessage
+                : kShowLaunchpadMessage,
+            0,
+            0);
+        if (shutdown_requested) {
+            for (int attempt = 0;
+                 attempt < 100 &&
+                 FindWindowW(kWindowClass, nullptr);
+                 ++attempt) {
+                Sleep(20);
+            }
+            return FindWindowW(kWindowClass, nullptr)
+                ? 1
+                : 0;
+        }
+        return 0;
+    }
+    if (shutdown_requested) {
         return 0;
     }
 

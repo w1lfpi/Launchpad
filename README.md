@@ -15,23 +15,18 @@
 
 ## Установка
 
-Для сборки нужны Visual Studio 2022, компонент **Desktop development with C++**
-и Windows SDK.
+Скачайте `WindowsLaunchpad-0.3.0-Setup-x64.exe` со страницы
+[Releases](https://github.com/w1lfpi/Launchpad/releases), запустите файл и
+пройдите обычную установку. Права администратора и Visual C++ Runtime не
+требуются.
 
-Откройте PowerShell в папке проекта и выполните:
+Launchpad появится в меню «Пуск». Нажмите по нему правой кнопкой мыши и
+выберите «Закрепить на панели задач». Автозапуск можно включить или отключить
+в установщике.
 
-```powershell
-cmake --preset vs2022-x64
-cmake --build --preset vs2022-x64-release --parallel
-ctest --test-dir .\out\build\vs2022-x64 -C Release --output-on-failure
-
-Set-ExecutionPolicy -Scope Process Bypass
-.\scripts\install-launchpad.ps1
-```
-
-Launchpad появится в меню «Пуск». Оттуда его можно закрепить на панели задач.
-Установка выполняется только для текущего пользователя и не требует прав
-администратора.
+Пока приложение не подписано цифровой подписью, Windows SmartScreen может
+показать предупреждение. В таком случае нажмите «Подробнее» → «Выполнить в
+любом случае».
 
 ## Добавление приложений
 
@@ -68,11 +63,20 @@ Launchpad.
 она недоступна — в резервную папку Launchpad. Установленная программа остаётся
 на компьютере.
 
-## Удаление Launchpad
+## Удаление
+
+Откройте «Параметры» → «Приложения» → «Установленные приложения», найдите
+Windows Launchpad и нажмите «Удалить». Папка приложений и раскладка
+сохраняются, чтобы не потеряться при переустановке.
+
+## Сборка из исходников
+
+Понадобятся Visual Studio с компонентом **Desktop development with C++**,
+CMake, Ninja и Inno Setup 7.
 
 ```powershell
-& "$env:LOCALAPPDATA\Programs\Windows Launchpad\uninstall-launchpad.ps1"
+Set-ExecutionPolicy -Scope Process Bypass
+.\scripts\build-installer.ps1
 ```
 
-Чтобы также удалить пользовательскую раскладку и ярлыки, добавьте
-`-RemoveUserData`.
+Готовый установщик появится в папке `dist`.
