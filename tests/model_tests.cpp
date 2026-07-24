@@ -49,6 +49,60 @@ int main() {
     expect(contains_insensitive(L"Anything", L""),
            "empty query matches");
 
+    const int exact_firefox =
+        search_match_score(L"Firefox", L"firefox");
+    const int prefix_firefox =
+        search_match_score(L"Firefox Developer Edition", L"firefox");
+    const int substring_firefox =
+        search_match_score(L"Mozilla Firefox", L"firefox");
+    expect(exact_firefox > prefix_firefox &&
+               prefix_firefox > substring_firefox,
+           "exact search ranks above prefix and substring matches");
+    expect(search_match_score(
+               L"Visual Studio Code",
+               L"vsc") != kNoSearchMatch,
+           "word-initial acronym matches an application name");
+    expect(search_match_score(
+               L"Firefox",
+               L"firfox") != kNoSearchMatch,
+           "ordered fuzzy search tolerates a missing character");
+    expect(search_match_score(
+               L"Firefox",
+               L"fierfox") != kNoSearchMatch,
+           "bigram search tolerates an adjacent transposition");
+    expect(search_match_score(
+               L"Visual Studio Code",
+               L"studio visual") != kNoSearchMatch,
+           "multi-token search does not require query token order");
+    expect(search_match_score(
+               L"Visual Studio Code",
+               L"vs") != kNoSearchMatch,
+           "short word-initial acronyms remain useful");
+    expect(search_match_score(
+               L"Visual Studio Code",
+               L"zx") == kNoSearchMatch,
+           "unrelated two-character queries do not use noisy fuzzy matching");
+    expect(search_match_score(
+               L"Калькулятор",
+               L"КАЛЬК") != kNoSearchMatch,
+           "fuzzy scoring keeps Cyrillic case-insensitive substring search");
+    expect(search_match_score(
+               L"Проводник",
+               L"paint") == kNoSearchMatch,
+           "fuzzy scoring rejects unrelated Unicode names");
+    const int deterministic_score = search_match_score(
+        L"Microsoft Visual Studio Code",
+        L"vsc");
+    expect(
+        deterministic_score ==
+            search_match_score(
+                L"Microsoft Visual Studio Code",
+                L"vsc"),
+        "search scoring is deterministic");
+    expect(normalize_search_text(L"  Visual-Studio__Code  ") ==
+               L"visual studio code",
+           "search normalization folds case and separators");
+
     expect(is_supported_app_extension(L".LNK"),
            "LNK extension is accepted case-insensitively");
     expect(is_supported_app_extension(L".appref-ms"),
@@ -373,6 +427,95 @@ int main() {
     expect(reorder_layout.items()[0].name == L"Бета" &&
                reorder_layout.items()[1].name == L"Alpha",
            "top-level reorder uses the final destination slot");
+    const std::vector<LayoutItem> reordered_apps =
+        reorder_layout.items();
+    expect(!reorder_layout.move_item(1, 1) &&
+               reorder_layout.items() == reordered_apps,
+           "dropping a top-level application on its current slot "
+           "does not mutate the layout");
+    expect(!reorder_layout.move_item(99, 0) &&
+               !reorder_layout.move_item(0, 99) &&
+               reorder_layout.items() == reordered_apps,
+           "invalid top-level reorder indices leave the layout "
+           "exactly unchanged");
+
+    LayoutDocument folder_item_reorder_layout;
+    folder_item_reorder_layout.reconcile({
+        {L"C:\\Apps\\One.lnk", L"One"},
+        {L"C:\\Apps\\Two.lnk", L"Two"},
+        {L"C:\\Apps\\Three.lnk", L"Three"},
+        {L"C:\\Apps\\Four.lnk", L"Four"},
+    });
+    expect(folder_item_reorder_layout.create_folder(
+               0,
+               1,
+               L"Pair"),
+           "top-level folder reorder fixture can create a folder");
+    const LayoutItem pair_folder =
+        folder_item_reorder_layout.items()[0];
+    expect(folder_item_reorder_layout.move_item(0, 2),
+           "a top-level folder can move after applications");
+    expect(folder_item_reorder_layout.items()[0].name == L"Three" &&
+               folder_item_reorder_layout.items()[1].name == L"Four" &&
+               folder_item_reorder_layout.items()[2] == pair_folder,
+           "moving a folder right shifts intervening applications "
+           "left without changing folder contents");
+    expect(folder_item_reorder_layout.move_item(2, 0),
+           "a top-level folder can move back before applications");
+    expect(folder_item_reorder_layout.items()[0] == pair_folder &&
+               folder_item_reorder_layout.items()[1].name == L"Three" &&
+               folder_item_reorder_layout.items()[2].name == L"Four",
+           "moving a folder left shifts intervening applications "
+           "right and restores the original order");
+
+    LayoutDocument focused_folder_reorder_layout;
+    focused_folder_reorder_layout.reconcile({
+        {L"C:\\Apps\\One.lnk", L"One"},
+        {L"C:\\Apps\\Two.lnk", L"Two"},
+        {L"C:\\Apps\\Three.lnk", L"Three"},
+        {L"C:\\Apps\\Four.lnk", L"Four"},
+    });
+    expect(focused_folder_reorder_layout.create_folder(
+               0,
+               1,
+               L"Group") &&
+               focused_folder_reorder_layout.add_app_to_folder(1, 0) &&
+               focused_folder_reorder_layout.add_app_to_folder(1, 0),
+           "folder child reorder fixture can collect four applications");
+    const std::vector<std::wstring> original_child_order{
+        L"C:\\Apps\\Two.lnk",
+        L"C:\\Apps\\One.lnk",
+        L"C:\\Apps\\Three.lnk",
+        L"C:\\Apps\\Four.lnk",
+    };
+    expect(focused_folder_reorder_layout.items()[0].children ==
+               original_child_order,
+           "folder child reorder fixture starts in deterministic order");
+    expect(focused_folder_reorder_layout.move_folder_app(0, 1, 3),
+           "a folder child can move from the middle to the last slot");
+    expect(focused_folder_reorder_layout.items()[0].children ==
+               std::vector<std::wstring>{
+                   L"C:\\Apps\\Two.lnk",
+                   L"C:\\Apps\\Three.lnk",
+                   L"C:\\Apps\\Four.lnk",
+                   L"C:\\Apps\\One.lnk",
+               },
+           "moving a child right shifts every intervening child left");
+    expect(focused_folder_reorder_layout.move_folder_app(0, 3, 1),
+           "a folder child can move from the last slot back to the middle");
+    expect(focused_folder_reorder_layout.items()[0].children ==
+               original_child_order,
+           "moving a child left shifts intervening children right "
+           "and restores the original order");
+    const std::vector<LayoutItem> focused_folder_before_invalid =
+        focused_folder_reorder_layout.items();
+    expect(!focused_folder_reorder_layout.move_folder_app(0, 2, 2) &&
+               !focused_folder_reorder_layout.move_folder_app(0, 9, 0) &&
+               !focused_folder_reorder_layout.move_folder_app(0, 0, 9) &&
+               focused_folder_reorder_layout.items() ==
+                   focused_folder_before_invalid,
+           "self and invalid folder-child reorders leave the layout "
+           "exactly unchanged");
 
     const std::vector<std::pair<std::wstring, std::wstring>>
         folder_target_apps{

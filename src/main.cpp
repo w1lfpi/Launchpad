@@ -76,6 +76,14 @@ constexpr float kPageFlickVelocityDipsPerSecond = 650.0F;
 constexpr float kPageMaxVelocityPagesPerSecond = 1.6F;
 constexpr float kIconCornerRatio = 0.225F;
 constexpr double kFolderAnimationSeconds = 0.28;
+constexpr double kFolderDropAnimationSeconds = 0.26;
+constexpr double kRootReflowAnimationSeconds = 0.30;
+constexpr double kLiveReorderAnimationSeconds = 0.20;
+constexpr double kSearchFocusAnimationSeconds = 0.22;
+constexpr double kSearchCaretBlinkSeconds = 1.00;
+constexpr double kSearchCaretRevealDelaySeconds = 0.35;
+constexpr double kSearchCaretRevealSeconds = 0.23;
+constexpr double kFolderHoverActivationSeconds = 0.55;
 constexpr double kLongPressSeconds = 0.34;
 constexpr float kDragSlopDips = 6.0F;
 constexpr float kDragEdgeZoneDips = 48.0F;
@@ -141,6 +149,7 @@ struct FolderGeometry {
     D2D1_ROUNDED_RECT panel{};
     D2D1_RECT_F title{};
     D2D1_ROUNDED_RECT title_editor{};
+    float grid_left = 0.0F;
     float horizontal_padding = 0.0F;
     float grid_top = 0.0F;
     float cell_width = 0.0F;
@@ -199,6 +208,46 @@ float spring_ease_out(float value) {
     return 1.0F - decay *
         (std::cos(omega_d * value) +
          damping / root * std::sin(omega_d * value));
+}
+
+float lerp(float from, float to, float progress) {
+    return from + (to - from) * progress;
+}
+
+D2D1_RECT_F lerp_rect(
+    const D2D1_RECT_F& from,
+    const D2D1_RECT_F& to,
+    float progress) {
+    return D2D1::RectF(
+        lerp(from.left, to.left, progress),
+        lerp(from.top, to.top, progress),
+        lerp(from.right, to.right, progress),
+        lerp(from.bottom, to.bottom, progress));
+}
+
+std::size_t projected_reorder_position(
+    std::size_t position,
+    std::size_t source,
+    std::size_t destination) {
+    if (source == destination ||
+        source == std::numeric_limits<std::size_t>::max() ||
+        destination == std::numeric_limits<std::size_t>::max()) {
+        return position;
+    }
+    if (position == source) {
+        return destination;
+    }
+    if (source < destination &&
+        position > source &&
+        position <= destination) {
+        return position - 1;
+    }
+    if (destination < source &&
+        position >= destination &&
+        position < source) {
+        return position + 1;
+    }
+    return position;
 }
 
 void box_blur_bgra(
@@ -1339,6 +1388,9 @@ private:
                     D2D1::SizeU(LOWORD(lparam), HIWORD(lparam)));
             }
             return 0;
+        case WM_KILLFOCUS:
+            set_search_focused(false, false);
+            return 0;
         case WM_DPICHANGED: {
             const auto* suggested = reinterpret_cast<RECT*>(lparam);
             const UINT dpi = HIWORD(wparam);
@@ -1359,6 +1411,23 @@ private:
             InvalidateRect(hwnd_, nullptr, FALSE);
             return 0;
         }
+        case WM_SETCURSOR:
+            if (LOWORD(lparam) == HTCLIENT &&
+                open_folder_index_ == kNoPage &&
+                !delete_confirmation_active_ &&
+                !closing_ &&
+                !drag_active_ &&
+                !drag_candidate_ &&
+                !page_drag_active_) {
+                POINT point{};
+                if (GetCursorPos(&point) &&
+                    ScreenToClient(hwnd_, &point) &&
+                    hit_test_search(point.x, point.y)) {
+                    SetCursor(LoadCursorW(nullptr, IDC_IBEAM));
+                    return TRUE;
+                }
+            }
+            break;
         case WM_TIMER:
             if (wparam == kExternalDropRescanTimer) {
                 KillTimer(hwnd_, kExternalDropRescanTimer);
@@ -1479,6 +1548,20 @@ private:
                 mouse_down_on_folder_background_ =
                     !mouse_down_on_folder_item_;
                 return 0;
+            }
+            if (hit_test_search(
+                    left_mouse_down_x_,
+                    left_mouse_down_y_)) {
+                mouse_down_page_ = kNoPage;
+                mouse_down_on_item_ = false;
+                mouse_down_on_background_ = false;
+                selection_visible_ = false;
+                edit_mode_ = false;
+                set_search_focused(true);
+                return 0;
+            }
+            if (search_focused_) {
+                set_search_focused(false);
             }
             if (edit_mode_) {
                 mouse_down_delete_position_ =
@@ -1606,6 +1689,19 @@ private:
                     ReleaseCapture();
                 }
             }
+            if (drag_active_) {
+                update_drag(x, y);
+                finish_drag();
+                if (GetCapture() == hwnd_) {
+                    ReleaseCapture();
+                }
+                mouse_down_on_item_ = false;
+                mouse_down_on_background_ = false;
+                mouse_down_on_folder_item_ = false;
+                mouse_down_on_folder_background_ = false;
+                mouse_down_folder_position_ = kNoPage;
+                return 0;
+            }
             if (open_folder_index_ != kNoPage) {
                 const bool released_on_folder_item =
                     update_folder_pointer_selection(x, y);
@@ -1627,16 +1723,6 @@ private:
                 mouse_down_on_folder_item_ = false;
                 mouse_down_on_folder_background_ = false;
                 mouse_down_folder_position_ = kNoPage;
-                return 0;
-            }
-            if (drag_active_) {
-                update_drag(x, y);
-                finish_drag();
-                if (GetCapture() == hwnd_) {
-                    ReleaseCapture();
-                }
-                mouse_down_on_item_ = false;
-                mouse_down_on_background_ = false;
                 return 0;
             }
             if (drag_candidate_) {
@@ -1899,6 +1985,7 @@ private:
         search_format_->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
         search_format_->SetParagraphAlignment(
             DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+        search_format_->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
 
         if (FAILED(write_factory_->CreateTextFormat(
                 L"Segoe UI Variable Display",
@@ -2413,13 +2500,17 @@ private:
         if (chrome_visibility > 0.001F) {
             draw_search(size, chrome_visibility);
             draw_grid(size, chrome_visibility, opening_progress);
-            if (drag_active_) {
+            draw_folder_drop_animation(chrome_visibility);
+            if (drag_active_ &&
+                !(folder_extraction_ &&
+                  open_folder_index_ != kNoPage)) {
                 draw_drag_preview(visibility);
             }
             warm_adjacent_icons();
             draw_page_dots(size, chrome_visibility);
         } else {
             hit_regions_.clear();
+            root_drop_regions_.clear();
             delete_hit_regions_.clear();
             page_dot_regions_.clear();
         }
@@ -2430,6 +2521,8 @@ private:
             if (folder_drag_active_) {
                 draw_folder_drag_preview(
                     visibility * folder_progress);
+            } else if (drag_active_ && folder_extraction_) {
+                draw_drag_preview(visibility);
             }
         }
         if (delete_confirmation_active_) {
@@ -2467,16 +2560,141 @@ private:
         render_target_->FillRectangle(full, color_brush_.Get());
     }
 
-    void draw_search(const D2D1_SIZE_F& size, float visibility) {
-        const float width = std::clamp(size.width * 0.17F, 260.0F, 330.0F);
+    D2D1_ROUNDED_RECT search_box(
+        const D2D1_SIZE_F& size) const {
+        const float width =
+            std::clamp(size.width * 0.17F, 260.0F, 330.0F);
         constexpr float height = 32.0F;
         const float left = (size.width - width) * 0.5F;
-        const float top = 36.0F;
-        const D2D1_ROUNDED_RECT box{
+        constexpr float top = 36.0F;
+        return D2D1_ROUNDED_RECT{
             D2D1::RectF(left, top, left + width, top + height),
             5.0F,
             5.0F,
         };
+    }
+
+    float current_search_focus_progress() {
+        if (!search_focus_animation_active_) {
+            return search_focus_progress_;
+        }
+        const float raw = static_cast<float>(
+            elapsed_since(search_focus_animation_origin_) /
+            kSearchFocusAnimationSeconds);
+        if (raw >= 1.0F) {
+            search_focus_progress_ = search_focus_target_;
+            search_focus_animation_active_ = false;
+            return search_focus_progress_;
+        }
+        search_focus_progress_ = lerp(
+            search_focus_from_,
+            search_focus_target_,
+            smooth_step(raw));
+        return search_focus_progress_;
+    }
+
+    void reset_search_caret_blink(
+        bool delayed_reveal = false) {
+        LARGE_INTEGER counter{};
+        QueryPerformanceCounter(&counter);
+        search_caret_origin_ = counter.QuadPart;
+        search_caret_delayed_reveal_ = delayed_reveal;
+        search_caret_last_opacity_ =
+            delayed_reveal ? 0.0F : 1.0F;
+    }
+
+    float current_search_caret_opacity() const {
+        if (!search_focused_) {
+            return 0.0F;
+        }
+        double elapsed = elapsed_since(search_caret_origin_);
+        if (search_caret_delayed_reveal_) {
+            if (elapsed < kSearchCaretRevealDelaySeconds) {
+                return 0.0F;
+            }
+            elapsed -= kSearchCaretRevealDelaySeconds;
+            if (elapsed < kSearchCaretRevealSeconds) {
+                return smooth_step(static_cast<float>(
+                    elapsed / kSearchCaretRevealSeconds));
+            }
+            elapsed -= kSearchCaretRevealSeconds;
+        }
+
+        const double phase = std::fmod(
+            elapsed,
+            kSearchCaretBlinkSeconds);
+        if (phase < 0.45) {
+            return 1.0F;
+        }
+        if (phase < 0.55) {
+            return 1.0F - smooth_step(static_cast<float>(
+                (phase - 0.45) / 0.10));
+        }
+        if (phase < 0.90) {
+            return 0.0F;
+        }
+        return smooth_step(static_cast<float>(
+            (phase - 0.90) / 0.10));
+    }
+
+    void set_search_focused(
+        bool focused,
+        bool animate = true) {
+        const float target = focused ? 1.0F : 0.0F;
+        const float current = current_search_focus_progress();
+        if (search_focused_ == focused &&
+            std::abs(search_focus_target_ - target) < 0.001F) {
+            if (!animate) {
+                search_focus_progress_ = target;
+                search_focus_from_ = target;
+                search_focus_animation_active_ = false;
+            }
+            if (focused) {
+                search_all_selected_ = false;
+                reset_search_caret_blink();
+            }
+            if (hwnd_ && (!animate || focused)) {
+                InvalidateRect(hwnd_, nullptr, FALSE);
+            }
+            return;
+        }
+
+        search_focused_ = focused;
+        search_focus_from_ = current;
+        search_focus_target_ = target;
+        if (focused) {
+            reset_search_caret_blink(true);
+        } else {
+            search_all_selected_ = false;
+            search_caret_delayed_reveal_ = false;
+            search_caret_last_opacity_ = 0.0F;
+        }
+
+        const bool should_animate =
+            animate &&
+            animations_enabled_ &&
+            std::abs(target - current) >= 0.001F;
+        if (should_animate) {
+            LARGE_INTEGER counter{};
+            QueryPerformanceCounter(&counter);
+            search_focus_animation_origin_ = counter.QuadPart;
+            search_focus_animation_active_ = true;
+        } else {
+            search_focus_progress_ = target;
+            search_focus_from_ = target;
+            search_focus_animation_active_ = false;
+        }
+        if (hwnd_) {
+            InvalidateRect(hwnd_, nullptr, FALSE);
+        }
+    }
+
+    void draw_search(const D2D1_SIZE_F& size, float visibility) {
+        const D2D1_ROUNDED_RECT box = search_box(size);
+        const float width = box.rect.right - box.rect.left;
+        const float height = box.rect.bottom - box.rect.top;
+        const float focus_progress =
+            current_search_focus_progress();
 
         color_brush_->SetColor(D2D1::ColorF(0x2B292B));
         color_brush_->SetOpacity(0.55F * visibility);
@@ -2487,14 +2705,193 @@ private:
             white_brush_.Get(),
             1.0F);
 
-        const std::wstring text = search_.empty()
+        constexpr std::wstring_view search_icon = L"⌕";
+        constexpr std::wstring_view placeholder = L"Поиск";
+        const std::wstring_view text = search_.empty()
+            ? placeholder
+            : std::wstring_view(search_);
+        constexpr float content_padding = 11.0F;
+        constexpr float icon_text_gap = 7.0F;
+
+        ComPtr<IDWriteTextLayout> icon_layout;
+        ComPtr<IDWriteTextLayout> text_layout;
+        const bool icon_ready =
+            SUCCEEDED(write_factory_->CreateTextLayout(
+                search_icon.data(),
+                static_cast<UINT32>(search_icon.size()),
+                search_format_.Get(),
+                width,
+                height,
+                icon_layout.ReleaseAndGetAddressOf())) &&
+            SUCCEEDED(icon_layout->SetTextAlignment(
+                DWRITE_TEXT_ALIGNMENT_LEADING));
+        const bool text_ready =
+            SUCCEEDED(write_factory_->CreateTextLayout(
+                text.data(),
+                static_cast<UINT32>(text.size()),
+                search_format_.Get(),
+                width,
+                height,
+                text_layout.ReleaseAndGetAddressOf())) &&
+            SUCCEEDED(text_layout->SetTextAlignment(
+                DWRITE_TEXT_ALIGNMENT_LEADING));
+
+        DWRITE_TEXT_METRICS icon_metrics{};
+        DWRITE_TEXT_METRICS text_metrics{};
+        const bool metrics_ready =
+            icon_ready &&
+            text_ready &&
+            SUCCEEDED(icon_layout->GetMetrics(&icon_metrics)) &&
+            SUCCEEDED(text_layout->GetMetrics(&text_metrics));
+        if (metrics_ready) {
+            const float icon_width =
+                icon_metrics.widthIncludingTrailingWhitespace;
+            const float max_text_width = std::max(
+                1.0F,
+                width -
+                    (content_padding * 2.0F +
+                     icon_width + icon_text_gap));
+            if (SUCCEEDED(
+                    text_layout->SetMaxWidth(max_text_width))) {
+                text_layout->GetMetrics(&text_metrics);
+            }
+            const float text_width =
+                text_metrics.widthIncludingTrailingWhitespace;
+            const float group_width =
+                icon_width + icon_text_gap + text_width;
+            const float idle_left =
+                box.rect.left +
+                std::max(0.0F, (width - group_width) * 0.5F);
+            const float focused_left =
+                box.rect.left + content_padding;
+            const float content_progress = search_.empty()
+                ? focus_progress
+                : 1.0F;
+            const float icon_left = lerp(
+                idle_left,
+                focused_left,
+                content_progress);
+            const float text_left =
+                icon_left + icon_width + icon_text_gap;
+            const float text_scroll =
+                search_.empty()
+                    ? 0.0F
+                    : std::max(
+                          0.0F,
+                          text_width - max_text_width);
+            const float text_draw_left =
+                text_left - text_scroll;
+
+            white_brush_->SetOpacity(0.92F * visibility);
+            render_target_->DrawTextLayout(
+                D2D1::Point2F(icon_left, box.rect.top),
+                icon_layout.Get(),
+                white_brush_.Get(),
+                D2D1_DRAW_TEXT_OPTIONS_CLIP);
+
+            render_target_->PushAxisAlignedClip(
+                D2D1::RectF(
+                    std::max(
+                        box.rect.left + content_padding,
+                        text_left - 2.5F),
+                    box.rect.top,
+                    box.rect.right - content_padding,
+                    box.rect.bottom),
+                D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+
+            if (!search_.empty() &&
+                search_all_selected_ &&
+                text_width > 0.0F) {
+                const float selection_left =
+                    std::max(
+                        text_left,
+                        text_draw_left +
+                            text_metrics.left - 2.0F);
+                const float selection_top =
+                    std::max(
+                        box.rect.top + 4.0F,
+                        box.rect.top +
+                            text_metrics.top + 2.0F);
+                const float selection_right =
+                    std::min(
+                        box.rect.right - content_padding,
+                        text_draw_left +
+                            text_metrics.left +
+                            text_width + 2.0F);
+                const float selection_bottom =
+                    std::min(
+                        box.rect.bottom - 4.0F,
+                        box.rect.top +
+                            text_metrics.top +
+                            text_metrics.height - 2.0F);
+                if (selection_right > selection_left &&
+                    selection_bottom > selection_top) {
+                    const D2D1_ROUNDED_RECT selection{
+                        D2D1::RectF(
+                            selection_left,
+                            selection_top,
+                            selection_right,
+                            selection_bottom),
+                        3.0F,
+                        3.0F,
+                    };
+                    color_brush_->SetColor(
+                        D2D1::ColorF(0x0A84FF));
+                    color_brush_->SetOpacity(
+                        0.72F * visibility);
+                    render_target_->FillRoundedRectangle(
+                        selection,
+                        color_brush_.Get());
+                }
+            }
+
+            white_brush_->SetOpacity(
+                (search_.empty() ? 0.58F : 0.96F) *
+                visibility);
+            render_target_->DrawTextLayout(
+                D2D1::Point2F(text_draw_left, box.rect.top),
+                text_layout.Get(),
+                white_brush_.Get(),
+                D2D1_DRAW_TEXT_OPTIONS_NONE);
+
+            const float caret_opacity =
+                current_search_caret_opacity();
+            if (!search_all_selected_ &&
+                caret_opacity > 0.001F) {
+                const float unclamped_caret_x =
+                    search_.empty()
+                    ? text_left - 2.5F
+                    : text_draw_left +
+                        text_metrics.left +
+                        text_width + 1.0F;
+                const float caret_x = std::clamp(
+                    unclamped_caret_x,
+                    text_left - 2.5F,
+                    box.rect.right - content_padding);
+                white_brush_->SetOpacity(
+                    0.96F * visibility * caret_opacity);
+                render_target_->DrawLine(
+                    D2D1::Point2F(
+                        caret_x,
+                        box.rect.top + 5.5F),
+                    D2D1::Point2F(
+                        caret_x,
+                        box.rect.bottom - 5.5F),
+                    white_brush_.Get(),
+                    1.4F);
+            }
+            render_target_->PopAxisAlignedClip();
+            return;
+        }
+
+        const std::wstring fallback = search_.empty()
             ? L"⌕  Поиск"
             : search_;
         white_brush_->SetOpacity(
             (search_.empty() ? 0.58F : 0.96F) * visibility);
         render_target_->DrawTextW(
-            text.c_str(),
-            static_cast<UINT32>(text.size()),
+            fallback.c_str(),
+            static_cast<UINT32>(fallback.size()),
             search_format_.Get(),
             box.rect,
             white_brush_.Get(),
@@ -2697,6 +3094,23 @@ private:
             closing_) {
             return;
         }
+        set_search_focused(false, false);
+        folder_origin_bounds_valid_ = false;
+        folder_closing_visual_.reset();
+        folder_closing_hidden_position_ = kNoPage;
+        for (const HitRegion& region : hit_regions_) {
+            if (region.visible_position >= visible_items_.size()) {
+                continue;
+            }
+            const VisibleItem& visible =
+                visible_items_[region.visible_position];
+            if (visible.kind == VisibleItemKind::folder &&
+                visible.layout_index == layout_index) {
+                folder_origin_bounds_ = region.icon_bounds;
+                folder_origin_bounds_valid_ = true;
+                break;
+            }
+        }
         const launchpad::LayoutItem& folder =
             layout_.items()[layout_index];
         open_folder_app_indices_.clear();
@@ -2714,6 +3128,7 @@ private:
         folder_drag_active_ = false;
         folder_drag_source_position_ = kNoPage;
         folder_drag_target_position_ = kNoPage;
+        clear_folder_live_reflow();
         open_folder_index_ = layout_index;
         folder_name_editing_ = false;
         folder_name_buffer_.clear();
@@ -2763,11 +3178,15 @@ private:
         folder_drop_regions_.clear();
         folder_delete_hit_regions_.clear();
         open_folder_app_indices_.clear();
+        folder_closing_visual_.reset();
+        folder_closing_hidden_position_ = kNoPage;
         folder_panel_bounds_valid_ = false;
+        folder_origin_bounds_valid_ = false;
         folder_drag_active_ = false;
         folder_drag_candidate_ = false;
         folder_drag_source_position_ = kNoPage;
         folder_drag_target_position_ = kNoPage;
+        clear_folder_live_reflow();
         folder_close_start_progress_ = 1.0F;
         InvalidateRect(hwnd_, nullptr, FALSE);
     }
@@ -2775,7 +3194,8 @@ private:
     static FolderGeometry calculate_folder_geometry(
         const D2D1_SIZE_F& size,
         std::size_t child_count,
-        float reveal) {
+        float reveal,
+        const D2D1_RECT_F* origin) {
         const std::size_t visible_count =
             std::min(child_count, kFolderPageCapacity);
         const std::size_t visible_rows = std::clamp<std::size_t>(
@@ -2797,17 +3217,32 @@ private:
             std::max(240.0F, size.height - 132.0F);
         const float target_height =
             std::min(desired_height, available_height);
-        const float scale =
-            0.94F + 0.06F * std::clamp(reveal, 0.0F, 1.0F);
-        const float panel_width = target_width * scale;
-        const float panel_height = target_height * scale;
+        const float panel_width = target_width;
+        const float panel_height = target_height;
         const float panel_left =
             (size.width - panel_width) * 0.5F;
         const float panel_top =
             (size.height - panel_height) * 0.5F;
+        const D2D1_RECT_F target_panel = D2D1::RectF(
+            panel_left,
+            panel_top,
+            panel_left + panel_width,
+            panel_top + panel_height);
+        const float morph_progress =
+            std::clamp(reveal, 0.0F, 1.0F);
+        const D2D1_RECT_F current_panel = origin
+            ? lerp_rect(*origin, target_panel, morph_progress)
+            : lerp_rect(
+                  D2D1::RectF(
+                      size.width * 0.5F - panel_width * 0.47F,
+                      size.height * 0.5F - panel_height * 0.47F,
+                      size.width * 0.5F + panel_width * 0.47F,
+                      size.height * 0.5F + panel_height * 0.47F),
+                  target_panel,
+                  morph_progress);
         const float vertical_padding =
             std::min(
-                (top_padding + bottom_padding) * scale,
+                top_padding + bottom_padding,
                 panel_height * 0.35F);
         const float scaled_top_padding =
             vertical_padding *
@@ -2829,8 +3264,8 @@ private:
             54.0F,
             98.0F);
         const float title_bottom =
-            panel_top - 18.0F * scale;
-        const float title_height = 46.0F * scale;
+            panel_top - 18.0F;
+        const float title_height = 46.0F;
         const D2D1_RECT_F title = D2D1::RectF(
             panel_left + 32.0F,
             title_bottom - title_height,
@@ -2841,13 +3276,25 @@ private:
 
         return FolderGeometry{
             .panel = D2D1_ROUNDED_RECT{
-                D2D1::RectF(
-                    panel_left,
-                    panel_top,
-                    panel_left + panel_width,
-                    panel_top + panel_height),
-                34.0F * scale,
-                34.0F * scale,
+                current_panel,
+                lerp(
+                    origin
+                        ? std::max(
+                              8.0F,
+                              (origin->right - origin->left) *
+                                  kIconCornerRatio)
+                        : 28.0F,
+                    34.0F,
+                    morph_progress),
+                lerp(
+                    origin
+                        ? std::max(
+                              8.0F,
+                              (origin->bottom - origin->top) *
+                                  kIconCornerRatio)
+                        : 28.0F,
+                    34.0F,
+                    morph_progress),
             },
             .title = title,
             .title_editor = D2D1_ROUNDED_RECT{
@@ -2859,6 +3306,7 @@ private:
                 8.0F,
                 8.0F,
             },
+            .grid_left = panel_left,
             .horizontal_padding = horizontal_padding,
             .grid_top = panel_top + scaled_top_padding,
             .cell_width = cell_width,
@@ -2875,15 +3323,23 @@ private:
         folder_drop_regions_.clear();
         folder_delete_hit_regions_.clear();
         folder_panel_bounds_valid_ = false;
-        if (open_folder_index_ >= layout_.items().size()) {
-            return;
+        const launchpad::LayoutItem* folder = nullptr;
+        if (folder_closing_ && folder_closing_visual_) {
+            folder = &*folder_closing_visual_;
+        } else if (
+            open_folder_index_ < layout_.items().size() &&
+            layout_.items()[open_folder_index_].kind ==
+                launchpad::LayoutItemKind::folder) {
+            folder = &layout_.items()[open_folder_index_];
         }
-        const launchpad::LayoutItem& folder =
-            layout_.items()[open_folder_index_];
-        if (folder.kind != launchpad::LayoutItemKind::folder) {
+        if (!folder) {
             return;
         }
 
+        const float content_visibility = smooth_step(
+            (visibility - 0.10F) / 0.78F);
+        const float title_visibility = smooth_step(
+            (visibility - 0.24F) / 0.58F);
         const D2D1_RECT_F full =
             D2D1::RectF(0.0F, 0.0F, size.width, size.height);
         color_brush_->SetColor(D2D1::ColorF(0x050506));
@@ -2893,8 +3349,11 @@ private:
         const FolderGeometry geometry =
             calculate_folder_geometry(
                 size,
-                folder.children.size(),
-                visibility);
+                folder->children.size(),
+                visibility,
+                folder_origin_bounds_valid_
+                    ? &folder_origin_bounds_
+                    : nullptr);
         const D2D1_ROUNDED_RECT& panel = geometry.panel;
         folder_panel_bounds_ = panel.rect;
         folder_panel_bounds_valid_ = true;
@@ -2912,18 +3371,20 @@ private:
         const D2D1_RECT_F& title_rect = geometry.title;
         if (folder_name_editing_) {
             color_brush_->SetColor(D2D1::ColorF(0x111012));
-            color_brush_->SetOpacity(0.58F * visibility);
+            color_brush_->SetOpacity(
+                0.58F * title_visibility);
             render_target_->FillRoundedRectangle(
                 geometry.title_editor,
                 color_brush_.Get());
-            white_brush_->SetOpacity(0.28F * visibility);
+            white_brush_->SetOpacity(
+                0.28F * title_visibility);
             render_target_->DrawRoundedRectangle(
                 geometry.title_editor,
                 white_brush_.Get(),
                 1.0F);
         }
         std::wstring editing_title;
-        std::wstring_view title = folder.name;
+        std::wstring_view title = folder->name;
         if (folder_name_editing_) {
             editing_title = folder_name_buffer_;
             if (std::fmod(elapsed_seconds(), 1.0) < 0.58) {
@@ -2931,7 +3392,8 @@ private:
             }
             title = editing_title;
         }
-        white_brush_->SetOpacity(0.96F * visibility);
+        white_brush_->SetOpacity(
+            0.96F * title_visibility);
         render_target_->DrawTextW(
             title.data(),
             static_cast<UINT32>(title.size()),
@@ -2950,19 +3412,35 @@ private:
             folder_page_ * kFolderPageCapacity;
         const std::size_t last = std::min(
             first + kFolderPageCapacity,
-            folder.children.size());
+            folder->children.size());
 
         for (std::size_t position = first;
              position < last;
              ++position) {
-            const std::size_t local = position - first;
+            if (folder_closing_ &&
+                position == folder_closing_hidden_position_) {
+                continue;
+            }
+            const std::size_t logical_local = position - first;
+            const std::size_t logical_column =
+                logical_local % kFolderColumns;
+            const std::size_t logical_row =
+                logical_local / kFolderColumns;
+            const float logical_center_x =
+                geometry.grid_left + horizontal_padding +
+                cell_width *
+                    (static_cast<float>(logical_column) + 0.5F);
+            const float logical_center_y =
+                grid_top +
+                cell_height *
+                    (static_cast<float>(logical_row) + 0.5F);
+            const std::size_t visual_position =
+                projected_folder_position(position);
+            const std::size_t local = visual_position - first;
             const std::size_t column = local % kFolderColumns;
             const std::size_t row = local / kFolderColumns;
-            const std::size_t app_index =
-                position < open_folder_app_indices_.size()
-                    ? open_folder_app_indices_[position]
-                    : app_index_for_path(
-                          folder.children[position]);
+            const std::size_t app_index = app_index_for_path(
+                folder->children[position]);
             if (app_index == kNoPage) {
                 continue;
             }
@@ -2975,37 +3453,124 @@ private:
                     icon_ready = ensure_icon(app);
                 }
             }
-            const float center_x =
-                panel.rect.left + horizontal_padding +
+            float center_x =
+                geometry.grid_left + horizontal_padding +
                 cell_width * (static_cast<float>(column) + 0.5F);
-            const float center_y =
+            float center_y =
                 grid_top +
                 cell_height * (static_cast<float>(row) + 0.5F);
+            const std::wstring drag_key =
+                launchpad::lowercase(folder->children[position]);
+            if (folder_drag_reflow_active_ &&
+                !drag_key.empty()) {
+                const auto previous =
+                    folder_drag_reflow_from_centers_.find(
+                        drag_key);
+                if (previous !=
+                    folder_drag_reflow_from_centers_.end()) {
+                    const float reflow_progress =
+                        live_reorder_progress(
+                            folder_drag_reflow_active_,
+                            folder_drag_reflow_origin_);
+                    center_x = lerp(
+                        previous->second.x,
+                        center_x,
+                        reflow_progress);
+                    center_y = lerp(
+                        previous->second.y,
+                        center_y,
+                        reflow_progress);
+                }
+            }
+            if (folder_drag_active_ && !drag_key.empty()) {
+                folder_drag_current_centers_.insert_or_assign(
+                    drag_key,
+                    D2D1::Point2F(center_x, center_y));
+            }
             const bool selected =
                 folder_selection_visible_ &&
                 position == folder_selected_position_;
             const bool drag_source =
                 folder_drag_active_ &&
                 position == folder_drag_source_position_;
-            const bool drag_target =
-                folder_drag_active_ &&
-                position == folder_drag_target_position_ &&
-                position != folder_drag_source_position_;
-            const float item_scale = drag_target
-                ? 1.09F
-                : (selected ? 1.04F : 1.0F);
-            const float item_opacity =
-                visibility * (drag_source ? 0.18F : 1.0F);
+            const float item_scale =
+                selected ? 1.04F : 1.0F;
             const float half = icon_size * item_scale * 0.5F;
-            const D2D1_RECT_F icon_rect = D2D1::RectF(
+            const D2D1_RECT_F target_icon_rect = D2D1::RectF(
                 center_x - half,
                 center_y - half,
                 center_x + half,
                 center_y + half);
+            D2D1_RECT_F source_icon_rect{};
+            if (folder_origin_bounds_valid_ &&
+                folder_page_ == 0 &&
+                local < 9) {
+                const float origin_size =
+                    folder_origin_bounds_.right -
+                    folder_origin_bounds_.left;
+                const float padding = origin_size * 0.16F;
+                const float gap = origin_size * 0.055F;
+                const float mini_size =
+                    (origin_size - padding * 2.0F -
+                     gap * 2.0F) /
+                    3.0F;
+                const float left =
+                    folder_origin_bounds_.left + padding +
+                    static_cast<float>(local % 3) *
+                        (mini_size + gap);
+                const float top =
+                    folder_origin_bounds_.top + padding +
+                    static_cast<float>(local / 3) *
+                        (mini_size + gap);
+                source_icon_rect = D2D1::RectF(
+                    left,
+                    top,
+                    left + mini_size,
+                    top + mini_size);
+            } else {
+                const float source_half = icon_size * 0.12F;
+                const D2D1_POINT_2F source_center =
+                    folder_origin_bounds_valid_
+                    ? D2D1::Point2F(
+                          (folder_origin_bounds_.left +
+                           folder_origin_bounds_.right) *
+                              0.5F,
+                          (folder_origin_bounds_.top +
+                           folder_origin_bounds_.bottom) *
+                              0.5F)
+                    : D2D1::Point2F(center_x, center_y);
+                source_icon_rect = D2D1::RectF(
+                    source_center.x - source_half,
+                    source_center.y - source_half,
+                    source_center.x + source_half,
+                    source_center.y + source_half);
+            }
+            const float child_delay =
+                std::min(0.22F, static_cast<float>(local) * 0.010F);
+            const float child_progress = std::clamp(
+                (visibility - child_delay) /
+                    (1.0F - child_delay),
+                0.0F,
+                1.0F);
+            const D2D1_RECT_F icon_rect = lerp_rect(
+                source_icon_rect,
+                target_icon_rect,
+                child_progress);
+            const float animated_center_x =
+                (icon_rect.left + icon_rect.right) * 0.5F;
+            const float animated_center_y =
+                (icon_rect.top + icon_rect.bottom) * 0.5F;
+            const float item_opacity =
+                (local < 9 && folder_page_ == 0
+                     ? visibility
+                     : content_visibility) *
+                (drag_source ? 0.05F : 1.0F);
+            const float animated_size =
+                icon_rect.right - icon_rect.left;
             const D2D1_ROUNDED_RECT rounded{
                 icon_rect,
-                icon_size * kIconCornerRatio,
-                icon_size * kIconCornerRatio,
+                animated_size * kIconCornerRatio,
+                animated_size * kIconCornerRatio,
             };
             if (edit_mode_ && !drag_source) {
                 const float phase =
@@ -3015,12 +3580,13 @@ private:
                 render_target_->SetTransform(
                     D2D1::Matrix3x2F::Rotation(
                         angle,
-                        D2D1::Point2F(center_x, center_y)));
+                        D2D1::Point2F(
+                            animated_center_x,
+                            animated_center_y)));
             }
-            if (selected || drag_target) {
+            if (selected) {
                 white_brush_->SetOpacity(
-                    (drag_target ? 0.18F : 0.12F) *
-                    item_opacity);
+                    0.12F * item_opacity);
                 const D2D1_ROUNDED_RECT highlight{
                     D2D1::RectF(
                         icon_rect.left - 6.0F,
@@ -3054,7 +3620,10 @@ private:
                     icon_rect,
                     white_brush_.Get());
             }
-            if (edit_mode_ && !drag_source) {
+            const bool interactions_ready =
+                visibility >= 0.985F && !folder_closing_;
+            if (edit_mode_ && !drag_source &&
+                interactions_ready) {
                 const D2D1_RECT_F delete_bounds =
                     draw_delete_button(icon_rect, item_opacity);
                 folder_delete_hit_regions_.push_back(HitRegion{
@@ -3063,7 +3632,9 @@ private:
                     .visible_position = position,
                 });
             }
-            white_brush_->SetOpacity(0.94F * item_opacity);
+            white_brush_->SetOpacity(
+                0.94F * content_visibility *
+                (drag_source ? 0.05F : 1.0F));
             const D2D1_RECT_F label = D2D1::RectF(
                 center_x - cell_width * 0.46F,
                 center_y + half + 8.0F,
@@ -3076,19 +3647,25 @@ private:
                 label,
                 white_brush_.Get(),
                 D2D1_DRAW_TEXT_OPTIONS_CLIP);
-            folder_hit_regions_.push_back(HitRegion{
-                .bounds = icon_rect,
-                .icon_bounds = icon_rect,
-                .visible_position = position,
-            });
-            if (folder_drag_active_) {
+            if (interactions_ready) {
+                folder_hit_regions_.push_back(HitRegion{
+                    .bounds = target_icon_rect,
+                    .icon_bounds = target_icon_rect,
+                    .visible_position = position,
+                });
+            }
+            if (folder_drag_active_ && interactions_ready) {
                 folder_drop_regions_.push_back(HitRegion{
                     .bounds = D2D1::RectF(
-                        center_x - cell_width * 0.48F,
-                        center_y - cell_height * 0.42F,
-                        center_x + cell_width * 0.48F,
-                        center_y + cell_height * 0.42F),
-                    .icon_bounds = icon_rect,
+                        logical_center_x - cell_width * 0.5F,
+                        logical_center_y - cell_height * 0.5F,
+                        logical_center_x + cell_width * 0.5F,
+                        logical_center_y + cell_height * 0.5F),
+                    .icon_bounds = D2D1::RectF(
+                        logical_center_x - icon_size * 0.5F,
+                        logical_center_y - icon_size * 0.5F,
+                        logical_center_x + icon_size * 0.5F,
+                        logical_center_y + icon_size * 0.5F),
                     .visible_position = position,
                 });
             }
@@ -3098,7 +3675,7 @@ private:
 
         const std::size_t page_count = std::max<std::size_t>(
             1,
-            (folder.children.size() + kFolderPageCapacity - 1) /
+            (folder->children.size() + kFolderPageCapacity - 1) /
                 kFolderPageCapacity);
         if (page_count > 1) {
             const float spacing = 16.0F;
@@ -3109,7 +3686,7 @@ private:
             for (std::size_t page = 0; page < page_count; ++page) {
                 white_brush_->SetOpacity(
                     (page == folder_page_ ? 0.90F : 0.28F) *
-                    visibility);
+                    content_visibility);
                 render_target_->FillEllipse(
                     D2D1::Ellipse(
                         D2D1::Point2F(
@@ -3369,6 +3946,259 @@ private:
             center.y + hit_radius);
     }
 
+    std::wstring root_visual_key(
+        const VisibleItem& visible) const {
+        if (visible.kind == VisibleItemKind::app) {
+            if (visible.app_index >= apps_.size()) {
+                return {};
+            }
+            return L"A|" +
+                launchpad::lowercase(
+                    apps_[visible.app_index].path);
+        }
+        if (visible.layout_index >= layout_.items().size()) {
+            return {};
+        }
+        const launchpad::LayoutItem& folder =
+            layout_.items()[visible.layout_index];
+        if (folder.kind != launchpad::LayoutItemKind::folder) {
+            return {};
+        }
+        std::wstring key =
+            L"F|" + launchpad::lowercase(folder.name);
+        if (!folder.children.empty()) {
+            key += L"|" +
+                launchpad::lowercase(folder.children.front());
+        }
+        return key;
+    }
+
+    bool root_live_reorder_active(
+        std::size_t page) const noexcept {
+        return drag_active_ &&
+            folder_drop_target_visible_position_ == kNoPage &&
+            !drag_folder_intent_locked_ &&
+            drag_source_visible_position_ < visible_items_.size() &&
+            drag_target_visible_position_ < visible_items_.size() &&
+            visible_page_for_position(
+                drag_source_visible_position_) == page &&
+            visible_page_for_position(
+                drag_target_visible_position_) == page;
+    }
+
+    std::size_t projected_root_position(
+        std::size_t position,
+        std::size_t page) const noexcept {
+        if (!root_live_reorder_active(page)) {
+            return position;
+        }
+        return projected_reorder_position(
+            position,
+            drag_source_visible_position_,
+            drag_target_visible_position_);
+    }
+
+    float live_reorder_progress(
+        bool active,
+        std::int64_t origin) const {
+        if (!active || !animations_enabled_) {
+            return 1.0F;
+        }
+        return ease_out_cubic(static_cast<float>(
+            elapsed_since(origin) /
+            kLiveReorderAnimationSeconds));
+    }
+
+    void seed_root_drag_centers() {
+        if (!root_drag_current_centers_.empty()) {
+            return;
+        }
+        for (const HitRegion& region : hit_regions_) {
+            if (region.visible_position >= visible_items_.size()) {
+                continue;
+            }
+            const std::wstring key = root_visual_key(
+                visible_items_[region.visible_position]);
+            if (key.empty()) {
+                continue;
+            }
+            root_drag_current_centers_.insert_or_assign(
+                key,
+                D2D1::Point2F(
+                    (region.icon_bounds.left +
+                     region.icon_bounds.right) *
+                        0.5F,
+                    (region.icon_bounds.top +
+                     region.icon_bounds.bottom) *
+                        0.5F));
+        }
+    }
+
+    void begin_root_live_reflow() {
+        seed_root_drag_centers();
+        root_drag_reflow_from_centers_ =
+            root_drag_current_centers_;
+        LARGE_INTEGER counter{};
+        QueryPerformanceCounter(&counter);
+        root_drag_reflow_origin_ = counter.QuadPart;
+        root_drag_reflow_active_ =
+            animations_enabled_ &&
+            !root_drag_reflow_from_centers_.empty();
+    }
+
+    void clear_root_live_reflow() {
+        root_drag_reflow_active_ = false;
+        root_drag_reflow_from_centers_.clear();
+        root_drag_current_centers_.clear();
+    }
+
+    void seed_folder_drag_centers() {
+        if (!folder_drag_current_centers_.empty() ||
+            open_folder_index_ >= layout_.items().size()) {
+            return;
+        }
+        const launchpad::LayoutItem& folder =
+            layout_.items()[open_folder_index_];
+        if (folder.kind != launchpad::LayoutItemKind::folder) {
+            return;
+        }
+        for (const HitRegion& region : folder_hit_regions_) {
+            if (region.visible_position >= folder.children.size()) {
+                continue;
+            }
+            folder_drag_current_centers_.insert_or_assign(
+                launchpad::lowercase(
+                    folder.children[region.visible_position]),
+                D2D1::Point2F(
+                    (region.icon_bounds.left +
+                     region.icon_bounds.right) *
+                        0.5F,
+                    (region.icon_bounds.top +
+                     region.icon_bounds.bottom) *
+                        0.5F));
+        }
+    }
+
+    void begin_folder_live_reflow() {
+        seed_folder_drag_centers();
+        folder_drag_reflow_from_centers_ =
+            folder_drag_current_centers_;
+        LARGE_INTEGER counter{};
+        QueryPerformanceCounter(&counter);
+        folder_drag_reflow_origin_ = counter.QuadPart;
+        folder_drag_reflow_active_ =
+            animations_enabled_ &&
+            !folder_drag_reflow_from_centers_.empty();
+    }
+
+    void clear_folder_live_reflow() {
+        folder_drag_reflow_active_ = false;
+        folder_drag_reflow_from_centers_.clear();
+        folder_drag_current_centers_.clear();
+    }
+
+    bool folder_live_reorder_active() const noexcept {
+        return folder_drag_active_ &&
+            folder_drag_source_position_ != kNoPage &&
+            folder_drag_target_position_ != kNoPage &&
+            folder_drag_source_position_ /
+                    kFolderPageCapacity ==
+                folder_page_ &&
+            folder_drag_target_position_ /
+                    kFolderPageCapacity ==
+                folder_page_;
+    }
+
+    std::size_t projected_folder_position(
+        std::size_t position) const noexcept {
+        if (!folder_live_reorder_active()) {
+            return position;
+        }
+        return projected_reorder_position(
+            position,
+            folder_drag_source_position_,
+            folder_drag_target_position_);
+    }
+
+    void capture_root_reflow_positions() {
+        root_reflow_from_centers_.clear();
+        for (const HitRegion& region : hit_regions_) {
+            if (region.visible_position >= visible_items_.size()) {
+                continue;
+            }
+            const std::wstring key = root_visual_key(
+                visible_items_[region.visible_position]);
+            if (key.empty()) {
+                continue;
+            }
+            root_reflow_from_centers_.insert_or_assign(
+                key,
+                D2D1::Point2F(
+                    (region.icon_bounds.left +
+                     region.icon_bounds.right) *
+                        0.5F,
+                    (region.icon_bounds.top +
+                     region.icon_bounds.bottom) *
+                        0.5F));
+        }
+    }
+
+    float current_folder_drop_progress() const {
+        if (!folder_drop_animation_active_) {
+            return 1.0F;
+        }
+        return std::clamp(
+            static_cast<float>(
+                elapsed_since(folder_drop_animation_origin_) /
+                kFolderDropAnimationSeconds),
+            0.0F,
+            1.0F);
+    }
+
+    void draw_folder_drop_animation(float visibility) {
+        if (!folder_drop_animation_active_ ||
+            !folder_drop_target_bounds_valid_) {
+            return;
+        }
+        const std::size_t app_index = app_index_for_path(
+            folder_drop_animation_path_);
+        if (app_index == kNoPage) {
+            return;
+        }
+        AppEntry& app = apps_[app_index];
+        const float raw = current_folder_drop_progress();
+        const float progress = ease_out_cubic(raw);
+        const D2D1_RECT_F icon_rect = lerp_rect(
+            folder_drop_animation_from_bounds_,
+            folder_drop_animation_target_bounds_,
+            progress);
+        const float opacity =
+            (1.0F -
+             smooth_step((raw - 0.68F) / 0.32F)) *
+            visibility;
+        if (opacity <= 0.001F) {
+            return;
+        }
+        if (app.icon) {
+            draw_icon_bitmap(
+                app.icon.Get(),
+                icon_rect,
+                opacity);
+            return;
+        }
+        const float size = icon_rect.right - icon_rect.left;
+        const D2D1_ROUNDED_RECT rounded{
+            icon_rect,
+            size * kIconCornerRatio,
+            size * kIconCornerRatio,
+        };
+        color_brush_->SetColor(D2D1::ColorF(app.color));
+        color_brush_->SetOpacity(0.96F * opacity);
+        render_target_->FillRoundedRectangle(
+            rounded,
+            color_brush_.Get());
+    }
+
     void draw_page(
         std::size_t page,
         float page_offset,
@@ -3389,17 +4219,89 @@ private:
             visibility * page_opacity;
 
         for (std::size_t position = first; position < last; ++position) {
-            const std::size_t page_position = position - first;
+            const std::size_t logical_page_position =
+                position - first;
+            const int logical_column = static_cast<int>(
+                logical_page_position %
+                launchpad::kGridColumns);
+            const int logical_row = static_cast<int>(
+                logical_page_position /
+                launchpad::kGridColumns);
+            const float logical_center_x =
+                horizontal_margin +
+                cell_width * (logical_column + 0.5F) +
+                page_offset;
+            const float logical_center_y =
+                top + cell_height * (logical_row + 0.43F);
+            const std::size_t visual_position =
+                projected_root_position(position, page);
+            const std::size_t page_position =
+                visual_position - first;
             const int column = static_cast<int>(
                 page_position % launchpad::kGridColumns);
             const int row = static_cast<int>(
                 page_position / launchpad::kGridColumns);
-            const float center_x =
+            const VisibleItem& visible = visible_items_[position];
+            const float target_center_x =
                 horizontal_margin +
                 cell_width * (column + 0.5F) +
                 page_offset;
-            const float center_y =
+            const float target_center_y =
                 top + cell_height * (row + 0.43F);
+            float center_x = target_center_x;
+            float center_y = target_center_y;
+            if (root_reflow_animation_active_ &&
+                page == current_page_ &&
+                std::abs(page_offset) < 0.01F) {
+                const auto previous =
+                    root_reflow_from_centers_.find(
+                        root_visual_key(visible));
+                if (previous !=
+                    root_reflow_from_centers_.end()) {
+                    const float reflow_progress =
+                        ease_out_cubic(static_cast<float>(
+                            elapsed_since(
+                                root_reflow_animation_origin_) /
+                            kRootReflowAnimationSeconds));
+                    center_x = lerp(
+                        previous->second.x,
+                        target_center_x,
+                        reflow_progress);
+                    center_y = lerp(
+                        previous->second.y,
+                        target_center_y,
+                        reflow_progress);
+                }
+            }
+            const std::wstring visual_key =
+                root_visual_key(visible);
+            if (root_drag_reflow_active_ &&
+                drag_active_ &&
+                !visual_key.empty()) {
+                const auto previous =
+                    root_drag_reflow_from_centers_.find(
+                        visual_key);
+                if (previous !=
+                    root_drag_reflow_from_centers_.end()) {
+                    const float reflow_progress =
+                        live_reorder_progress(
+                            root_drag_reflow_active_,
+                            root_drag_reflow_origin_);
+                    center_x = lerp(
+                        previous->second.x,
+                        center_x,
+                        reflow_progress);
+                    center_y = lerp(
+                        previous->second.y,
+                        center_y,
+                        reflow_progress);
+                }
+            }
+            if (drag_active_ && !visual_key.empty()) {
+                root_drag_current_centers_.insert_or_assign(
+                    visual_key,
+                    D2D1::Point2F(center_x, center_y));
+            }
             const bool selected =
                 selection_visible_ && position == selected_position_;
             const bool drag_source =
@@ -3409,14 +4311,34 @@ private:
                 drag_active_ &&
                 position ==
                     folder_drop_target_visible_position_;
+            const bool folder_intent_target =
+                drag_active_ &&
+                drag_folder_intent_locked_ &&
+                position ==
+                    folder_hover_candidate_visible_position_;
+            const bool accepting_folder =
+                folder_drop_animation_active_ &&
+                visible.kind == VisibleItemKind::folder &&
+                visible.layout_index ==
+                    folder_drop_animation_target_layout_index_;
+            constexpr float pi = 3.14159265358979323846F;
+            const float accept_pulse = accepting_folder
+                ? 1.0F +
+                    std::sin(
+                        pi * current_folder_drop_progress()) *
+                        0.075F
+                : 1.0F;
             const float scale =
                 motion_scale *
+                accept_pulse *
                 (folder_drop_target
                      ? 1.12F
-                     : (selected ? 1.035F : 1.0F));
+                     : (folder_intent_target
+                            ? 1.065F
+                            : (selected ? 1.035F : 1.0F)));
             const float item_opacity =
                 base_item_opacity *
-                (drag_source ? 0.18F : 1.0F);
+                (drag_source ? 0.06F : 1.0F);
             const float half = icon_size * scale * 0.5F;
             const D2D1_RECT_F icon_rect = D2D1::RectF(
                 center_x - half,
@@ -3431,7 +4353,6 @@ private:
                 actual_icon_size * kIconCornerRatio,
             };
 
-            const VisibleItem& visible = visible_items_[position];
             AppEntry* app = app_for_visible(visible);
             const launchpad::LayoutItem* folder =
                 visible.kind == VisibleItemKind::folder &&
@@ -3452,9 +4373,14 @@ private:
                         angle,
                         D2D1::Point2F(center_x, center_y)));
             }
-            if (selected || folder_drop_target) {
+            if (selected || folder_drop_target ||
+                folder_intent_target) {
                 white_brush_->SetOpacity(
-                    (folder_drop_target ? 0.18F : 0.10F) *
+                    (folder_drop_target
+                         ? 0.18F
+                         : (folder_intent_target
+                                ? 0.12F
+                                : 0.10F)) *
                     item_opacity);
                 const D2D1_ROUNDED_RECT highlight{
                     D2D1::RectF(
@@ -3502,6 +4428,17 @@ private:
                 render_target_->FillRoundedRectangle(
                     rounded_icon,
                     color_brush_.Get());
+                if (accepting_folder) {
+                    const float fallback_half =
+                        actual_icon_size * 0.12F;
+                    folder_drop_animation_target_bounds_ =
+                        D2D1::RectF(
+                            center_x - fallback_half,
+                            center_y - fallback_half,
+                            center_x + fallback_half,
+                            center_y + fallback_half);
+                    folder_drop_target_bounds_valid_ = true;
+                }
                 const float padding = actual_icon_size * 0.16F;
                 const float gap = actual_icon_size * 0.055F;
                 const float mini_size =
@@ -3513,13 +4450,8 @@ private:
                      child < preview_count;
                      ++child) {
                     const std::size_t child_app_index =
-                        visible.layout_index ==
-                                    open_folder_index_ &&
-                                child <
-                                    open_folder_app_indices_.size()
-                            ? open_folder_app_indices_[child]
-                            : app_index_for_path(
-                                  folder->children[child]);
+                        app_index_for_path(
+                            folder->children[child]);
                     if (child_app_index == kNoPage) {
                         continue;
                     }
@@ -3552,16 +4484,34 @@ private:
                         mini_size * kIconCornerRatio,
                         mini_size * kIconCornerRatio,
                     };
+                    const bool animated_drop_child =
+                        folder_drop_animation_active_ &&
+                        visible.layout_index ==
+                            folder_drop_animation_target_layout_index_ &&
+                        launchpad::lowercase(
+                            folder->children[child]) ==
+                            launchpad::lowercase(
+                                folder_drop_animation_path_);
+                    float child_opacity = item_opacity;
+                    if (animated_drop_child) {
+                        folder_drop_animation_target_bounds_ =
+                            mini_rect;
+                        folder_drop_target_bounds_valid_ = true;
+                        child_opacity *= smooth_step(
+                            (current_folder_drop_progress() -
+                             0.52F) /
+                            0.48F);
+                    }
                     if (child_ready) {
                         draw_icon_bitmap(
                             child_app.icon.Get(),
                             mini_rect,
-                            item_opacity);
+                            child_opacity);
                     } else {
                         color_brush_->SetColor(
                             D2D1::ColorF(child_app.color));
                         color_brush_->SetOpacity(
-                            0.92F * item_opacity);
+                            0.92F * child_opacity);
                         render_target_->FillRoundedRectangle(
                             mini_rounded,
                             color_brush_.Get());
@@ -3627,6 +4577,19 @@ private:
                     .icon_bounds = icon_rect,
                     .visible_position = position,
                 });
+                root_drop_regions_.push_back(HitRegion{
+                    .bounds = D2D1::RectF(
+                        logical_center_x - cell_width * 0.5F,
+                        logical_center_y - cell_height * 0.5F,
+                        logical_center_x + cell_width * 0.5F,
+                        logical_center_y + cell_height * 0.5F),
+                    .icon_bounds = D2D1::RectF(
+                        logical_center_x - icon_size * 0.5F,
+                        logical_center_y - icon_size * 0.5F,
+                        logical_center_x + icon_size * 0.5F,
+                        logical_center_y + icon_size * 0.5F),
+                    .visible_position = position,
+                });
             }
             render_target_->SetTransform(
                 D2D1::Matrix3x2F::Identity());
@@ -3638,7 +4601,11 @@ private:
         float visibility,
         float opening_progress) {
         hit_regions_.clear();
+        root_drop_regions_.clear();
         delete_hit_regions_.clear();
+        if (folder_drop_animation_active_) {
+            folder_drop_target_bounds_valid_ = false;
+        }
         if (visible_items_.empty()) {
             white_brush_->SetOpacity(0.72F * visibility);
             const std::wstring message = apps_.empty()
@@ -3858,7 +4825,9 @@ private:
                 pending_page_break = false;
                 visible_items_.push_back(std::move(visible));
             };
-        if (search_.empty()) {
+        const std::wstring normalized_search =
+            launchpad::normalize_search_text(search_);
+        if (normalized_search.empty()) {
             for (std::size_t layout_index = 0;
                  layout_index < layout_.items().size();
                  ++layout_index) {
@@ -3895,29 +4864,53 @@ private:
                 }
             }
         } else {
+            struct SearchResult {
+                VisibleItem visible;
+                int score = launchpad::kNoSearchMatch;
+                std::wstring normalized_name;
+                std::wstring normalized_path;
+                std::size_t source_order = 0;
+            };
             std::unordered_set<std::wstring> seen;
+            std::vector<SearchResult> results;
+            results.reserve(apps_.size());
             const auto add_search_result =
-                [this, &seen, &append_visible](
+                [this, &seen, &results](
                     std::size_t layout_index,
                     std::size_t child_index,
-                    const std::wstring& path) {
+                    const std::wstring& path,
+                    std::size_t source_order) {
                     const std::size_t app_index =
                         app_index_for_path(path);
-                    if (app_index == kNoPage ||
-                        !launchpad::contains_insensitive(
-                            apps_[app_index].name,
-                            search_) ||
-                        !seen.insert(
-                            launchpad::lowercase(path)).second) {
+                    if (app_index == kNoPage) {
                         return;
                     }
-                    append_visible(VisibleItem{
-                        .kind = VisibleItemKind::app,
-                        .layout_index = layout_index,
-                        .child_index = child_index,
-                        .app_index = app_index,
+                    const int score =
+                        launchpad::search_match_score(
+                            apps_[app_index].name,
+                            search_);
+                    const std::wstring normalized_path =
+                        launchpad::lowercase(path);
+                    if (score == launchpad::kNoSearchMatch ||
+                        !seen.insert(normalized_path).second) {
+                        return;
+                    }
+                    results.push_back(SearchResult{
+                        .visible = VisibleItem{
+                            .kind = VisibleItemKind::app,
+                            .layout_index = layout_index,
+                            .child_index = child_index,
+                            .app_index = app_index,
+                        },
+                        .score = score,
+                        .normalized_name =
+                            launchpad::normalize_search_text(
+                                apps_[app_index].name),
+                        .normalized_path = normalized_path,
+                        .source_order = source_order,
                     });
                 };
+            std::size_t source_order = 0;
             for (std::size_t layout_index = 0;
                  layout_index < layout_.items().size();
                  ++layout_index) {
@@ -3927,7 +4920,8 @@ private:
                     add_search_result(
                         layout_index,
                         0,
-                        item.app_path);
+                        item.app_path,
+                        source_order++);
                 } else if (
                     item.kind ==
                     launchpad::LayoutItemKind::folder) {
@@ -3937,9 +4931,32 @@ private:
                         add_search_result(
                             layout_index,
                             child,
-                            item.children[child]);
+                            item.children[child],
+                            source_order++);
                     }
                 }
+            }
+            std::ranges::stable_sort(
+                results,
+                [](const SearchResult& left,
+                   const SearchResult& right) {
+                    if (left.score != right.score) {
+                        return left.score > right.score;
+                    }
+                    if (left.normalized_name !=
+                        right.normalized_name) {
+                        return left.normalized_name <
+                            right.normalized_name;
+                    }
+                    if (left.normalized_path !=
+                        right.normalized_path) {
+                        return left.normalized_path <
+                            right.normalized_path;
+                    }
+                    return left.source_order < right.source_order;
+                });
+            for (SearchResult& result : results) {
+                append_visible(std::move(result.visible));
             }
         }
         current_page_ = std::min(
@@ -3979,17 +4996,31 @@ private:
             }
             return;
         }
+        if (!search_focused_) {
+            return;
+        }
         if (character == L'\b') {
             if (!search_.empty()) {
-                search_.pop_back();
+                if (search_all_selected_) {
+                    search_.clear();
+                } else {
+                    search_.pop_back();
+                }
+                search_all_selected_ = false;
                 selection_visible_ = false;
+                reset_search_caret_blink();
                 rebuild_filter();
             }
             return;
         }
         if (character >= 32 && character != 127) {
+            if (search_all_selected_) {
+                search_.clear();
+                search_all_selected_ = false;
+            }
             search_.push_back(character);
             selection_visible_ = false;
+            reset_search_caret_blink();
             rebuild_filter();
         }
     }
@@ -4084,14 +5115,46 @@ private:
                 return false;
             }
         }
+        if (search_focused_ &&
+            (GetKeyState(VK_CONTROL) & 0x8000) != 0 &&
+            key == L'A') {
+            if (!search_.empty()) {
+                search_all_selected_ = true;
+                selection_visible_ = false;
+                InvalidateRect(hwnd_, nullptr, FALSE);
+            }
+            return true;
+        }
+        if (search_focused_ &&
+            key == VK_DELETE &&
+            search_all_selected_) {
+            search_.clear();
+            search_all_selected_ = false;
+            selection_visible_ = false;
+            reset_search_caret_blink();
+            rebuild_filter();
+            return true;
+        }
         switch (key) {
         case VK_ESCAPE:
+            if (search_focused_) {
+                if (!search_.empty()) {
+                    search_.clear();
+                    search_all_selected_ = false;
+                    reset_search_caret_blink();
+                    rebuild_filter();
+                } else {
+                    set_search_focused(false);
+                }
+                return true;
+            }
             if (!search_.empty()) {
                 search_.clear();
+                search_all_selected_ = false;
                 rebuild_filter();
-            } else {
-                request_close();
+                return true;
             }
+            request_close();
             return true;
         case VK_F5:
             rescan_apps();
@@ -4667,6 +5730,8 @@ private:
         folder_drag_candidate_ = false;
         folder_drag_active_ = true;
         edit_mode_ = true;
+        clear_folder_live_reflow();
+        seed_folder_drag_centers();
         folder_drag_target_position_ =
             folder_drag_source_position_;
         folder_selection_visible_ = false;
@@ -4677,6 +5742,8 @@ private:
         if (!folder_extraction_) {
             return;
         }
+        folder_closing_visual_.reset();
+        folder_closing_hidden_position_ = kNoPage;
         FolderExtractionTransaction transaction =
             std::move(*folder_extraction_);
         folder_extraction_.reset();
@@ -4739,10 +5806,15 @@ private:
             .folder_page = folder_page_,
             .root_page = current_page_,
         };
+        folder_closing_visual_ = folder;
+        folder_closing_hidden_position_ =
+            folder_drag_source_position_;
         if (!layout_.extract_folder_app(
                 folder_index,
                 folder_drag_source_position_,
                 available_apps())) {
+            folder_closing_visual_.reset();
+            folder_closing_hidden_position_ = kNoPage;
             return false;
         }
 
@@ -4751,7 +5823,12 @@ private:
             folder_extraction_->app_path;
         const std::size_t root_page =
             folder_extraction_->root_page;
-        finish_folder_close();
+        folder_drag_active_ = false;
+        folder_drag_candidate_ = false;
+        folder_drag_source_position_ = kNoPage;
+        folder_drag_target_position_ = kNoPage;
+        clear_folder_live_reflow();
+        close_folder();
         rebuild_filter(root_page);
         const std::size_t source_position =
             visible_position_for_root_app(extracted_path);
@@ -4773,6 +5850,10 @@ private:
         drag_current_y_ = y;
         drag_target_visible_position_ = kNoPage;
         folder_drop_target_visible_position_ = kNoPage;
+        folder_hover_candidate_visible_position_ = kNoPage;
+        folder_hover_origin_ = 0;
+        drag_folder_intent_locked_ = false;
+        clear_root_live_reflow();
         drag_provisional_page_ = false;
         drag_edge_direction_ = 0;
         drag_edge_latched_ = false;
@@ -4798,7 +5879,6 @@ private:
         }
         folder_drag_current_x_ = x;
         folder_drag_current_y_ = y;
-        folder_drag_target_position_ = kNoPage;
         const D2D1_POINT_2F point = client_point_to_dips(x, y);
         if (folder_panel_bounds_valid_ &&
             !folder_animation_active_ &&
@@ -4817,15 +5897,19 @@ private:
             promote_folder_drag_to_root(x, y);
             return;
         }
+        std::size_t next_target = kNoPage;
         for (const HitRegion& region : folder_drop_regions_) {
             if (point.x >= region.bounds.left &&
                 point.x <= region.bounds.right &&
                 point.y >= region.bounds.top &&
                 point.y <= region.bounds.bottom) {
-                folder_drag_target_position_ =
-                    region.visible_position;
+                next_target = region.visible_position;
                 break;
             }
+        }
+        if (next_target != folder_drag_target_position_) {
+            begin_folder_live_reflow();
+            folder_drag_target_position_ = next_target;
         }
         InvalidateRect(hwnd_, nullptr, FALSE);
     }
@@ -4848,6 +5932,7 @@ private:
         folder_drag_source_position_ = kNoPage;
         folder_drag_target_position_ = kNoPage;
         folder_drop_regions_.clear();
+        clear_folder_live_reflow();
         if (changed) {
             save_layout_state();
             refresh_open_folder_apps();
@@ -4871,6 +5956,7 @@ private:
         folder_drag_source_position_ = kNoPage;
         folder_drag_target_position_ = kNoPage;
         folder_drop_regions_.clear();
+        clear_folder_live_reflow();
         InvalidateRect(hwnd_, nullptr, FALSE);
     }
 
@@ -4894,6 +5980,8 @@ private:
         drag_candidate_ = false;
         drag_active_ = true;
         edit_mode_ = true;
+        clear_root_live_reflow();
+        seed_root_drag_centers();
         drag_source_page_ = visible_page_for_position(
             drag_source_visible_position_);
         drag_provisional_page_ = false;
@@ -4902,6 +5990,9 @@ private:
         drag_target_visible_position_ =
             drag_source_visible_position_;
         folder_drop_target_visible_position_ = kNoPage;
+        folder_hover_candidate_visible_position_ = kNoPage;
+        folder_hover_origin_ = 0;
+        drag_folder_intent_locked_ = false;
         selection_visible_ = false;
         write_drag_diagnostic(
             L"start",
@@ -4918,52 +6009,103 @@ private:
         }
         drag_current_x_ = x;
         drag_current_y_ = y;
-        drag_target_visible_position_ = kNoPage;
-        folder_drop_target_visible_position_ = kNoPage;
         const D2D1_POINT_2F point = client_point_to_dips(x, y);
-        for (const HitRegion& region : hit_regions_) {
+        std::size_t next_target = kNoPage;
+        const HitRegion* target_region = nullptr;
+        for (const HitRegion& region : root_drop_regions_) {
             if (point.x < region.bounds.left ||
                 point.x > region.bounds.right ||
                 point.y < region.bounds.top ||
                 point.y > region.bounds.bottom) {
                 continue;
             }
-            drag_target_visible_position_ =
-                region.visible_position;
-            if (region.visible_position ==
-                    drag_source_visible_position_ ||
-                drag_source_visible_position_ >=
-                    visible_items_.size() ||
-                region.visible_position >= visible_items_.size()) {
-                break;
-            }
-
-            const VisibleItem& target =
-                visible_items_[region.visible_position];
-            const float width =
-                region.icon_bounds.right -
-                region.icon_bounds.left;
-            const float height =
-                region.icon_bounds.bottom -
-                region.icon_bounds.top;
-            const D2D1_RECT_F inner = D2D1::RectF(
-                region.icon_bounds.left + width * 0.12F,
-                region.icon_bounds.top + height * 0.12F,
-                region.icon_bounds.right - width * 0.12F,
-                region.icon_bounds.bottom - height * 0.12F);
-            const bool in_folder_zone =
-                point.x >= inner.left &&
-                point.x <= inner.right &&
-                point.y >= inner.top &&
-                point.y <= inner.bottom;
-            if (in_folder_zone &&
-                drag_source_kind_ == VisibleItemKind::app &&
-                (target.kind == VisibleItemKind::app ||
-                 target.kind == VisibleItemKind::folder)) {
-                folder_drop_target_visible_position_ =
-                    region.visible_position;
-            }
+            next_target = region.visible_position;
+            target_region = &region;
             break;
+        }
+
+        bool folder_hover = false;
+        bool existing_folder_target = false;
+        if (target_region &&
+            next_target != drag_source_visible_position_ &&
+            drag_source_kind_ == VisibleItemKind::app &&
+            drag_source_visible_position_ <
+                visible_items_.size() &&
+            next_target < visible_items_.size()) {
+            const VisibleItem& target =
+                visible_items_[next_target];
+            existing_folder_target =
+                target.kind == VisibleItemKind::folder;
+            if (existing_folder_target ||
+                target.kind == VisibleItemKind::app) {
+                const float width =
+                    target_region->icon_bounds.right -
+                    target_region->icon_bounds.left;
+                const float height =
+                    target_region->icon_bounds.bottom -
+                    target_region->icon_bounds.top;
+                // Existing folders get a generous magnetic area,
+                // while the outer edge of the cell still remains
+                // available for ordinary reordering.
+                const bool already_locked =
+                    drag_folder_intent_locked_ &&
+                    folder_hover_candidate_visible_position_ ==
+                        next_target;
+                const float expansion =
+                    existing_folder_target
+                    ? (already_locked ? 0.48F : 0.38F)
+                    : (already_locked ? 0.28F : 0.20F);
+                const D2D1_RECT_F intent_bounds = D2D1::RectF(
+                    target_region->icon_bounds.left -
+                        width * expansion,
+                    target_region->icon_bounds.top -
+                        height * expansion,
+                    target_region->icon_bounds.right +
+                        width * expansion,
+                    target_region->icon_bounds.bottom +
+                        height * expansion);
+                folder_hover =
+                    point.x >= intent_bounds.left &&
+                    point.x <= intent_bounds.right &&
+                    point.y >= intent_bounds.top &&
+                    point.y <= intent_bounds.bottom;
+            }
+        }
+
+        if (folder_hover) {
+            if (folder_hover_candidate_visible_position_ !=
+                next_target) {
+                folder_hover_candidate_visible_position_ =
+                    next_target;
+                LARGE_INTEGER counter{};
+                QueryPerformanceCounter(&counter);
+                folder_hover_origin_ = counter.QuadPart;
+            }
+        } else {
+            folder_hover_candidate_visible_position_ = kNoPage;
+            folder_hover_origin_ = 0;
+        }
+
+        std::size_t next_folder_target = kNoPage;
+        if (existing_folder_target && folder_hover) {
+            next_folder_target = next_target;
+        } else if (folder_hover &&
+            folder_hover_candidate_visible_position_ ==
+                next_target &&
+            elapsed_since(folder_hover_origin_) >=
+                kFolderHoverActivationSeconds) {
+            next_folder_target = next_target;
+        }
+
+        if (next_target != drag_target_visible_position_ ||
+            next_folder_target !=
+                folder_drop_target_visible_position_ ||
+            folder_hover != drag_folder_intent_locked_) {
+            begin_root_live_reflow();
+            drag_target_visible_position_ = next_target;
+            folder_drop_target_visible_position_ =
+                next_folder_target;
+            drag_folder_intent_locked_ = folder_hover;
         }
         write_drag_diagnostic(
             folder_drop_target_visible_position_ != kNoPage
@@ -4973,6 +6115,23 @@ private:
             y,
             drag_target_visible_position_);
         update_drag_edge_hover_state();
+        InvalidateRect(hwnd_, nullptr, FALSE);
+    }
+
+    void maybe_activate_folder_hover() {
+        if (!drag_active_ ||
+            folder_drop_target_visible_position_ != kNoPage ||
+            !drag_folder_intent_locked_ ||
+            folder_hover_candidate_visible_position_ == kNoPage ||
+            folder_hover_candidate_visible_position_ !=
+                drag_target_visible_position_ ||
+            elapsed_since(folder_hover_origin_) <
+                kFolderHoverActivationSeconds) {
+            return;
+        }
+        begin_root_live_reflow();
+        folder_drop_target_visible_position_ =
+            folder_hover_candidate_visible_position_;
         InvalidateRect(hwnd_, nullptr, FALSE);
     }
 
@@ -5049,6 +6208,10 @@ private:
         current_page_ = next;
         drag_target_visible_position_ = kNoPage;
         folder_drop_target_visible_position_ = kNoPage;
+        folder_hover_candidate_visible_position_ = kNoPage;
+        folder_hover_origin_ = 0;
+        drag_folder_intent_locked_ = false;
+        clear_root_live_reflow();
         drag_edge_latched_ = true;
         begin_page_transition(
             old_page,
@@ -5071,6 +6234,38 @@ private:
         const bool drop_on_new_page =
             drag_provisional_page_ &&
             destination_page >= visible_page_count();
+        const bool dropping_into_folder =
+            !drop_on_new_page &&
+            folder_drop_target_visible_position_ != kNoPage &&
+            folder_drop_target_visible_position_ <
+                visible_items_.size() &&
+            drag_source_layout_index_ < layout_.items().size() &&
+            layout_.items()[drag_source_layout_index_].kind ==
+                launchpad::LayoutItemKind::app;
+        std::wstring dropped_app_path;
+        D2D1_RECT_F folder_drop_from_bounds{};
+        if (dropping_into_folder) {
+            dropped_app_path =
+                layout_.items()[drag_source_layout_index_].app_path;
+            const D2D1_POINT_2F point = client_point_to_dips(
+                drag_current_x_,
+                drag_current_y_);
+            constexpr float drop_icon_half = 51.0F;
+            folder_drop_from_bounds = D2D1::RectF(
+                point.x - drop_icon_half,
+                point.y - drop_icon_half,
+                point.x + drop_icon_half,
+                point.y + drop_icon_half);
+        }
+        const bool animate_root_reflow =
+            animations_enabled_ &&
+            destination_page == drag_source_page_ &&
+            !page_transition_active_;
+        if (animate_root_reflow) {
+            capture_root_reflow_positions();
+        } else {
+            root_reflow_from_centers_.clear();
+        }
         bool changed = folder_extraction_.has_value();
         if (drop_on_new_page) {
             changed =
@@ -5138,14 +6333,69 @@ private:
         drag_source_layout_index_ = kNoPage;
         drag_target_visible_position_ = kNoPage;
         folder_drop_target_visible_position_ = kNoPage;
+        folder_hover_candidate_visible_position_ = kNoPage;
+        folder_hover_origin_ = 0;
+        drag_folder_intent_locked_ = false;
         drag_edge_direction_ = 0;
         drag_edge_latched_ = false;
         drag_provisional_page_ = false;
         folder_extraction_.reset();
+        clear_root_live_reflow();
         if (changed) {
             save_layout_state();
             rebuild_filter(destination_page);
+            LARGE_INTEGER animation_counter{};
+            QueryPerformanceCounter(&animation_counter);
+            root_reflow_animation_active_ =
+                animate_root_reflow &&
+                !root_reflow_from_centers_.empty();
+            root_reflow_animation_origin_ =
+                animation_counter.QuadPart;
+
+            folder_drop_animation_active_ = false;
+            folder_drop_target_bounds_valid_ = false;
+            folder_drop_animation_path_.clear();
+            folder_drop_animation_target_layout_index_ =
+                kNoPage;
+            if (animations_enabled_ &&
+                !dropped_app_path.empty()) {
+                const std::wstring normalized_drop_path =
+                    launchpad::lowercase(dropped_app_path);
+                for (std::size_t index = 0;
+                     index < layout_.items().size();
+                     ++index) {
+                    const launchpad::LayoutItem& item =
+                        layout_.items()[index];
+                    if (item.kind !=
+                        launchpad::LayoutItemKind::folder) {
+                        continue;
+                    }
+                    const bool contains_app =
+                        std::ranges::any_of(
+                            item.children,
+                            [&normalized_drop_path](
+                                const std::wstring& path) {
+                                return launchpad::lowercase(path) ==
+                                    normalized_drop_path;
+                            });
+                    if (!contains_app) {
+                        continue;
+                    }
+                    folder_drop_animation_active_ = true;
+                    folder_drop_animation_path_ =
+                        dropped_app_path;
+                    folder_drop_animation_target_layout_index_ =
+                        index;
+                    folder_drop_animation_from_bounds_ =
+                        folder_drop_from_bounds;
+                    folder_drop_animation_origin_ =
+                        animation_counter.QuadPart;
+                    break;
+                }
+            }
         } else {
+            root_reflow_animation_active_ = false;
+            root_reflow_from_centers_.clear();
             current_page_ = std::min(
                 drag_source_page_,
                 visible_page_count() - 1);
@@ -5159,15 +6409,21 @@ private:
         const bool restore_source_page = drag_active_;
         const bool restore_extraction =
             folder_extraction_.has_value();
+        const auto snapback_centers =
+            root_drag_current_centers_;
         drag_active_ = false;
         drag_candidate_ = false;
         drag_source_visible_position_ = kNoPage;
         drag_source_layout_index_ = kNoPage;
         drag_target_visible_position_ = kNoPage;
         folder_drop_target_visible_position_ = kNoPage;
+        folder_hover_candidate_visible_position_ = kNoPage;
+        folder_hover_origin_ = 0;
+        drag_folder_intent_locked_ = false;
         drag_edge_direction_ = 0;
         drag_edge_latched_ = false;
         drag_provisional_page_ = false;
+        clear_root_live_reflow();
         if (restore_extraction) {
             restore_folder_extraction();
             return;
@@ -5178,6 +6434,16 @@ private:
                 visible_page_count() - 1);
             select_first_item_on_page(current_page_);
             reset_page_motion();
+            if (animations_enabled_ &&
+                !snapback_centers.empty()) {
+                root_reflow_from_centers_ =
+                    snapback_centers;
+                LARGE_INTEGER counter{};
+                QueryPerformanceCounter(&counter);
+                root_reflow_animation_origin_ =
+                    counter.QuadPart;
+                root_reflow_animation_active_ = true;
+            }
         }
         InvalidateRect(hwnd_, nullptr, FALSE);
     }
@@ -5308,15 +6574,13 @@ private:
         if (!render_target_) {
             return false;
         }
-        const D2D1_SIZE_F size = render_target_->GetSize();
-        const float width =
-            std::clamp(size.width * 0.17F, 260.0F, 330.0F);
         const D2D1_POINT_2F point = client_point_to_dips(x, y);
-        const float left = (size.width - width) * 0.5F;
-        return point.x >= left &&
-            point.x <= left + width &&
-            point.y >= 36.0F &&
-            point.y <= 68.0F;
+        const D2D1_ROUNDED_RECT box =
+            search_box(render_target_->GetSize());
+        return point.x >= box.rect.left &&
+            point.x <= box.rect.right &&
+            point.y >= box.rect.top &&
+            point.y <= box.rect.bottom;
     }
 
     bool hit_test_folder_title(int x, int y) {
@@ -5331,7 +6595,10 @@ private:
             calculate_folder_geometry(
                 size,
                 layout_.items()[open_folder_index_].children.size(),
-                current_folder_progress());
+                current_folder_progress(),
+                folder_origin_bounds_valid_
+                    ? &folder_origin_bounds_
+                    : nullptr);
         const D2D1_POINT_2F point = client_point_to_dips(x, y);
         return
             point.x >= geometry.title_editor.rect.left &&
@@ -5631,7 +6898,9 @@ private:
                 MB_OK | MB_ICONERROR);
             return;
         }
+        set_search_focused(false, false);
         search_.clear();
+        search_all_selected_ = false;
         finish_folder_close();
         rebuild_filter();
         request_close();
@@ -5687,6 +6956,8 @@ private:
             finish_folder_close();
         }
         search_.clear();
+        search_all_selected_ = false;
+        set_search_focused(false, false);
         edit_mode_ = false;
         pending.target_page = std::min(
             pending.target_page,
@@ -5914,14 +7185,21 @@ private:
 
     void show_launchpad() {
         const RECT bounds = active_monitor_bounds();
-        if (!IsWindowVisible(hwnd_)) {
+        const bool was_hidden = !IsWindowVisible(hwnd_);
+        if (was_hidden) {
             capture_background(bounds);
+            if (!search_.empty()) {
+                search_.clear();
+                search_all_selected_ = false;
+                rebuild_filter(current_page_);
+            }
         }
         if (delete_confirmation_active_) {
             dismiss_delete_confirmation();
         }
         closing_ = false;
         edit_mode_ = false;
+        set_search_focused(false, false);
         close_start_visibility_ = 1.0F;
         reset_page_motion();
         SetWindowPos(
@@ -5953,6 +7231,7 @@ private:
         if (folder_drag_active_ || folder_drag_candidate_) {
             cancel_folder_drag();
         }
+        set_search_focused(false, false);
         edit_mode_ = false;
         if (!animations_enabled_) {
             finish_close();
@@ -5986,6 +7265,7 @@ private:
     void finish_close() {
         closing_ = false;
         edit_mode_ = false;
+        set_search_focused(false, false);
         if (delete_confirmation_active_) {
             dismiss_delete_confirmation();
         }
@@ -6041,6 +7321,51 @@ private:
             return;
         }
 
+        if (folder_drop_animation_active_ &&
+            elapsed_since(folder_drop_animation_origin_) >=
+                kFolderDropAnimationSeconds) {
+            folder_drop_animation_active_ = false;
+            folder_drop_target_bounds_valid_ = false;
+            folder_drop_animation_path_.clear();
+            folder_drop_animation_target_layout_index_ =
+                kNoPage;
+            InvalidateRect(hwnd_, nullptr, FALSE);
+        }
+        if (root_reflow_animation_active_ &&
+            elapsed_since(root_reflow_animation_origin_) >=
+                kRootReflowAnimationSeconds) {
+            root_reflow_animation_active_ = false;
+            root_reflow_from_centers_.clear();
+            InvalidateRect(hwnd_, nullptr, FALSE);
+        }
+        if (root_drag_reflow_active_ &&
+            elapsed_since(root_drag_reflow_origin_) >=
+                kLiveReorderAnimationSeconds) {
+            root_drag_reflow_active_ = false;
+            root_drag_reflow_from_centers_.clear();
+        }
+        if (folder_drag_reflow_active_ &&
+            elapsed_since(folder_drag_reflow_origin_) >=
+                kLiveReorderAnimationSeconds) {
+            folder_drag_reflow_active_ = false;
+            folder_drag_reflow_from_centers_.clear();
+        }
+        if (search_focus_animation_active_ &&
+            elapsed_since(search_focus_animation_origin_) >=
+                kSearchFocusAnimationSeconds) {
+            search_focus_progress_ = search_focus_target_;
+            search_focus_animation_active_ = false;
+            InvalidateRect(hwnd_, nullptr, FALSE);
+        }
+        const float caret_opacity =
+            current_search_caret_opacity();
+        if (std::abs(
+                caret_opacity -
+                search_caret_last_opacity_) >= 0.003F) {
+            search_caret_last_opacity_ = caret_opacity;
+            InvalidateRect(hwnd_, nullptr, FALSE);
+        }
+
         if (drag_candidate_ &&
             elapsed_since(drag_press_origin_) >=
                 kLongPressSeconds) {
@@ -6053,6 +7378,7 @@ private:
         }
         if (drag_active_) {
             maybe_advance_drag_page();
+            maybe_activate_folder_hover();
         }
 
         if (closing_ &&
@@ -6070,7 +7396,10 @@ private:
              (!intro_complete_ ||
               page_transition_active_ ||
               folder_animation_active_ ||
-              folder_name_editing_)) ||
+              folder_name_editing_ ||
+              folder_drop_animation_active_ ||
+              root_reflow_animation_active_ ||
+              search_focus_animation_active_)) ||
             page_drag_active_ ||
             drag_active_ ||
             folder_drag_active_ ||
@@ -6374,17 +7703,29 @@ private:
     bool drag_active_ = false;
     bool folder_drag_candidate_ = false;
     bool folder_drag_active_ = false;
+    bool folder_drop_animation_active_ = false;
+    bool folder_drop_target_bounds_valid_ = false;
+    bool root_reflow_animation_active_ = false;
+    bool root_drag_reflow_active_ = false;
+    bool folder_drag_reflow_active_ = false;
+    bool drag_folder_intent_locked_ = false;
     bool drag_provisional_page_ = false;
     bool drag_edge_latched_ = false;
     bool edit_mode_ = false;
     bool delete_confirmation_active_ = false;
     bool folder_panel_bounds_valid_ = false;
+    bool folder_origin_bounds_valid_ = false;
     bool icons_pending_ = true;
     bool frame_pump_active_ = false;
     bool timer_period_raised_ = false;
     bool external_drop_target_registered_ = false;
+    bool search_all_selected_ = false;
+    bool search_focused_ = false;
+    bool search_focus_animation_active_ = false;
+    bool search_caret_delayed_reveal_ = false;
     std::wstring search_;
     std::wstring folder_name_buffer_;
+    std::wstring folder_drop_animation_path_;
     std::wstring pending_delete_name_;
     std::wstring pending_delete_path_;
     fs::path applications_directory_;
@@ -6395,12 +7736,24 @@ private:
     std::vector<VisibleItem> visible_items_;
     std::vector<std::size_t> visible_page_starts_{0};
     std::vector<HitRegion> hit_regions_;
+    std::vector<HitRegion> root_drop_regions_;
     std::vector<HitRegion> delete_hit_regions_;
     std::vector<HitRegion> folder_hit_regions_;
     std::vector<HitRegion> folder_drop_regions_;
     std::vector<HitRegion> folder_delete_hit_regions_;
     std::vector<PageDotRegion> page_dot_regions_;
+    std::unordered_map<std::wstring, D2D1_POINT_2F>
+        root_reflow_from_centers_;
+    std::unordered_map<std::wstring, D2D1_POINT_2F>
+        root_drag_reflow_from_centers_;
+    std::unordered_map<std::wstring, D2D1_POINT_2F>
+        root_drag_current_centers_;
+    std::unordered_map<std::wstring, D2D1_POINT_2F>
+        folder_drag_reflow_from_centers_;
+    std::unordered_map<std::wstring, D2D1_POINT_2F>
+        folder_drag_current_centers_;
     std::vector<std::size_t> open_folder_app_indices_;
+    std::optional<launchpad::LayoutItem> folder_closing_visual_;
     std::optional<FolderExtractionTransaction> folder_extraction_;
     std::optional<PendingExternalDrop> pending_external_drop_;
     std::size_t current_page_ = 0;
@@ -6419,9 +7772,14 @@ private:
     std::size_t drag_source_layout_index_ = kNoPage;
     std::size_t drag_target_visible_position_ = kNoPage;
     std::size_t folder_drop_target_visible_position_ = kNoPage;
+    std::size_t folder_hover_candidate_visible_position_ =
+        kNoPage;
     std::size_t drag_source_page_ = 0;
     std::size_t folder_drag_source_position_ = kNoPage;
     std::size_t folder_drag_target_position_ = kNoPage;
+    std::size_t folder_closing_hidden_position_ = kNoPage;
+    std::size_t folder_drop_animation_target_layout_index_ =
+        kNoPage;
     int left_mouse_down_x_ = 0;
     int left_mouse_down_y_ = 0;
     int page_drag_start_x_ = 0;
@@ -6446,6 +7804,13 @@ private:
     std::int64_t page_transition_origin_ = 0;
     std::int64_t close_animation_origin_ = 0;
     std::int64_t folder_animation_origin_ = 0;
+    std::int64_t folder_drop_animation_origin_ = 0;
+    std::int64_t root_reflow_animation_origin_ = 0;
+    std::int64_t root_drag_reflow_origin_ = 0;
+    std::int64_t folder_drag_reflow_origin_ = 0;
+    std::int64_t search_focus_animation_origin_ = 0;
+    std::int64_t search_caret_origin_ = 0;
+    std::int64_t folder_hover_origin_ = 0;
     std::int64_t drag_press_origin_ = 0;
     std::int64_t folder_drag_press_origin_ = 0;
     std::int64_t drag_edge_hover_origin_ = 0;
@@ -6458,8 +7823,15 @@ private:
     float page_transition_target_offset_ = 0.0F;
     float page_transition_initial_velocity_ = 0.0F;
     float close_start_visibility_ = 1.0F;
+    float search_focus_progress_ = 0.0F;
+    float search_focus_from_ = 0.0F;
+    float search_focus_target_ = 0.0F;
+    float search_caret_last_opacity_ = 0.0F;
     float folder_close_start_progress_ = 1.0F;
     D2D1_RECT_F folder_panel_bounds_{};
+    D2D1_RECT_F folder_origin_bounds_{};
+    D2D1_RECT_F folder_drop_animation_from_bounds_{};
+    D2D1_RECT_F folder_drop_animation_target_bounds_{};
     std::array<PageDragSample, 8> page_drag_samples_{};
     std::size_t page_drag_sample_count_ = 0;
     HANDLE frame_timer_ = nullptr;
