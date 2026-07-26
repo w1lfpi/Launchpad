@@ -5,16 +5,21 @@
 #define WIN32_LEAN_AND_MEAN
 #endif
 
-#include "launchpad_model.h"
+#include "frame_diagnostics.h"
 #include "launchpad_layout.h"
+#include "launchpad_model.h"
 #include "resource.h"
 
 #include <windows.h>
 #include <windowsx.h>
 
 #include <d2d1.h>
+#include <d2d1_1.h>
+#include <d3d11_1.h>
+#include <dcomp.h>
 #include <dwrite.h>
 #include <dwmapi.h>
+#include <dxgi1_2.h>
 #include <mmsystem.h>
 #include <propkey.h>
 #include <propvarutil.h>
@@ -54,10 +59,12 @@ constexpr wchar_t kShortcutName[] = L"Launchpad.lnk";
 constexpr UINT_PTR kAnimationTimer = 1;
 constexpr UINT_PTR kExternalDropRescanTimer = 2;
 constexpr UINT_PTR kApplicationsWatchTimer = 3;
+constexpr UINT_PTR kLongPressTimer = 4;
 constexpr int kGlobalHotkeyId = 1;
 constexpr UINT kShowLaunchpadMessage = WM_APP + 42;
 constexpr UINT kExternalDropCompletedMessage = WM_APP + 43;
 constexpr UINT kExitLaunchpadMessage = WM_APP + 44;
+constexpr UINT kFallbackFrameTickMessage = WM_APP + 45;
 constexpr UINT kExternalDropRescanDelayMs = 160;
 constexpr int kExternalDropRescanAttempts = 20;
 constexpr UINT kApplicationsWatchIntervalMs = 800;
@@ -81,6 +88,12 @@ constexpr float kPageSettleVelocityDipsPerSecond =
 constexpr float kPageFlickVelocityDipsPerSecond = 650.0F;
 constexpr float kPageMaxVelocityPagesPerSecond = 1.6F;
 constexpr float kIconCornerRatio = 0.225F;
+constexpr double kIconPressSeconds = 0.070;
+constexpr double kIconReleaseSeconds = 0.180;
+constexpr double kIconActionDelaySeconds = 0.060;
+constexpr float kIconPressedScale = 0.94F;
+constexpr float kIconReleasePeakScale = 1.075F;
+constexpr float kIconReleaseDipScale = 0.985F;
 constexpr double kFolderAnimationSeconds = 0.28;
 constexpr double kFolderDropAnimationSeconds = 0.26;
 constexpr double kRootReflowAnimationSeconds = 0.30;
@@ -96,6 +109,9 @@ constexpr float kDragEdgeZoneDips = 48.0F;
 constexpr double kDragEdgeHoverSeconds = 0.48;
 constexpr float kFolderExtractionMarginDips = 18.0F;
 constexpr DWORD kHighResolutionTimerFlag = 0x00000002;
+constexpr DXGI_FORMAT kSwapChainFormat =
+    DXGI_FORMAT_B8G8R8A8_UNORM;
+constexpr UINT kPresentSyncInterval = 0;
 constexpr std::size_t kFolderColumns = 7;
 constexpr std::size_t kFolderRows = 4;
 constexpr std::size_t kFolderPageCapacity =
@@ -106,7 +122,7 @@ struct AppEntry {
     std::wstring path;
     std::uint32_t color = 0;
     wchar_t glyph = L'?';
-    ComPtr<ID2D1Bitmap> icon;
+    ComPtr<ID2D1Bitmap1> icon;
     bool icon_attempted = false;
 };
 
@@ -137,6 +153,33 @@ struct PageDragVisual {
 enum class VisibleItemKind {
     app,
     folder,
+};
+
+enum class IconActivationSurface {
+    none,
+    root,
+    folder,
+};
+
+enum class IconActivationPhase {
+    idle,
+    pressed,
+    released,
+};
+
+struct IconActivation {
+    IconActivationSurface surface = IconActivationSurface::none;
+    IconActivationPhase phase = IconActivationPhase::idle;
+    VisibleItemKind kind = VisibleItemKind::app;
+    std::wstring visual_key;
+    std::wstring app_path;
+    std::size_t folder_layout_index =
+        std::numeric_limits<std::size_t>::max();
+    std::int64_t phase_origin = 0;
+    float release_from_scale = 1.0F;
+    bool moved_beyond_click_slop = false;
+    bool dispatch_requested = false;
+    bool action_dispatched = false;
 };
 
 enum class DeleteModalButton {
@@ -1714,6 +1757,14 @@ public:
         background_mode_ = background_mode;
         diagnostics_enabled_ =
             has_command_line_switch(L"--diagnostics");
+        diagnostic_autoplay_ =
+            diagnostics_enabled_ &&
+            has_command_line_switch(
+                L"--diagnostic-autoplay");
+        diagnostic_icon_autoplay_ =
+            diagnostics_enabled_ &&
+            has_command_line_switch(
+                L"--diagnostic-icon-autoplay");
         animations_enabled_ = query_animations_enabled();
         const CatalogSetup catalog =
             prepare_applications_catalog();
@@ -1779,9 +1830,13 @@ public:
             initial_signature.value_or(0);
         rebuild_filter();
 
+        const D2D1_FACTORY_OPTIONS factory_options{};
         if (FAILED(D2D1CreateFactory(
                 D2D1_FACTORY_TYPE_SINGLE_THREADED,
-                factory_.ReleaseAndGetAddressOf()))) {
+                __uuidof(ID2D1Factory1),
+                &factory_options,
+                reinterpret_cast<void**>(
+                    factory_.ReleaseAndGetAddressOf())))) {
             return false;
         }
         if (FAILED(DWriteCreateFactory(
@@ -1872,26 +1927,37 @@ public:
                     1000.0 /
                     static_cast<double>(refresh_rate)),
                 2L,
-                16L));
+                50L));
         frame_period_qpc_ = std::max<std::int64_t>(
             1,
             static_cast<std::int64_t>(std::llround(
                 clock_frequency_ /
                 static_cast<double>(refresh_rate))));
-        frame_timer_ = CreateWaitableTimerExW(
-            nullptr,
-            nullptr,
-            kHighResolutionTimerFlag,
-            TIMER_MODIFY_STATE | SYNCHRONIZE);
-        if (!frame_timer_) {
+        // The QPC waitable timer can stop waking after the hidden background
+        // window is shown again on some Windows/Parallels combinations.  The
+        // multimedia timer is just as high resolution here, posts back to the
+        // UI thread, and has proven reliable at 120/144 Hz.  Keep the
+        // waitable path available only for explicit diagnostics.
+        const bool use_waitable_frame_timer =
+            diagnostics_enabled_ &&
+            has_command_line_switch(
+                L"--diagnostic-use-waitable");
+        if (use_waitable_frame_timer) {
             frame_timer_ = CreateWaitableTimerExW(
                 nullptr,
                 nullptr,
-                0,
+                kHighResolutionTimerFlag,
                 TIMER_MODIFY_STATE | SYNCHRONIZE);
-            if (frame_timer_ &&
-                timeBeginPeriod(1) == TIMERR_NOERROR) {
-                timer_period_raised_ = true;
+            if (!frame_timer_) {
+                frame_timer_ = CreateWaitableTimerExW(
+                    nullptr,
+                    nullptr,
+                    0,
+                    TIMER_MODIFY_STATE | SYNCHRONIZE);
+                if (frame_timer_ &&
+                    timeBeginPeriod(1) == TIMERR_NOERROR) {
+                    timer_period_raised_ = true;
+                }
             }
         }
 
@@ -1957,6 +2023,7 @@ public:
                 QS_ALLINPUT,
                 MWMO_INPUTAVAILABLE);
             if (wait_result == WAIT_FAILED) {
+                stop_frame_pump();
                 return 1;
             }
             if (handle_count == 1 &&
@@ -1979,6 +2046,36 @@ public:
     }
 
 private:
+    static void CALLBACK fallback_frame_timer_callback(
+        UINT,
+        UINT,
+        DWORD_PTR context,
+        DWORD_PTR,
+        DWORD_PTR) {
+        auto* self =
+            reinterpret_cast<LaunchpadWindow*>(context);
+        if (!self || !self->hwnd_) {
+            return;
+        }
+        const LONG generation = InterlockedCompareExchange(
+            &self->fallback_frame_generation_,
+            0,
+            0);
+        if (
+            InterlockedExchange(
+                &self->fallback_frame_tick_pending_,
+                TRUE) == FALSE &&
+            !PostMessageW(
+                self->hwnd_,
+                kFallbackFrameTickMessage,
+                static_cast<WPARAM>(generation),
+                0)) {
+            InterlockedExchange(
+                &self->fallback_frame_tick_pending_,
+                FALSE);
+        }
+    }
+
     static LRESULT CALLBACK window_proc(
         HWND hwnd,
         UINT message,
@@ -2069,9 +2166,10 @@ private:
         case WM_ERASEBKGND:
             return 1;
         case WM_SIZE:
-            if (render_target_) {
-                render_target_->Resize(
-                    D2D1::SizeU(LOWORD(lparam), HIWORD(lparam)));
+            if (swap_chain_) {
+                resize_swap_chain(
+                    LOWORD(lparam),
+                    HIWORD(lparam));
             }
             return 0;
         case WM_KILLFOCUS:
@@ -2088,10 +2186,9 @@ private:
                 suggested->right - suggested->left,
                 suggested->bottom - suggested->top,
                 SWP_NOACTIVATE | SWP_NOZORDER);
-            if (render_target_) {
-                render_target_->SetDpi(
-                    static_cast<float>(dpi),
-                    static_cast<float>(dpi));
+            if (render_target_ &&
+                !bind_swap_chain_target()) {
+                discard_device_resources();
             }
             update_icon_request_size(dpi);
             InvalidateRect(hwnd_, nullptr, FALSE);
@@ -2124,6 +2221,10 @@ private:
                 refresh_apps_if_changed();
                 return 0;
             }
+            if (wparam == kLongPressTimer) {
+                handle_long_press_timer();
+                return 0;
+            }
             if (!frame_timer_ && wparam == kAnimationTimer) {
                 animation_tick();
             }
@@ -2137,6 +2238,9 @@ private:
             }
             break;
         case WM_MOUSEMOVE:
+            update_icon_press_movement(
+                GET_X_LPARAM(lparam),
+                GET_Y_LPARAM(lparam));
             if (folder_drag_active_) {
                 update_folder_drag(
                     GET_X_LPARAM(lparam),
@@ -2185,6 +2289,7 @@ private:
             return 0;
         case WM_LBUTTONDOWN:
             SetFocus(hwnd_);
+            cancel_icon_activation();
             left_mouse_down_x_ = GET_X_LPARAM(lparam);
             left_mouse_down_y_ = GET_Y_LPARAM(lparam);
             mouse_down_delete_position_ = kNoPage;
@@ -2220,6 +2325,8 @@ private:
                         ? folder_selected_position_
                         : kNoPage;
                 if (mouse_down_on_folder_item_) {
+                    begin_folder_icon_press(
+                        folder_selected_position_);
                     folder_drag_candidate_ = true;
                     folder_drag_source_position_ =
                         folder_selected_position_;
@@ -2233,6 +2340,7 @@ private:
                     QueryPerformanceCounter(&counter);
                     folder_drag_press_origin_ =
                         counter.QuadPart;
+                    arm_long_press_timer();
                     SetCapture(hwnd_);
                 }
                 mouse_down_on_folder_background_ =
@@ -2248,6 +2356,12 @@ private:
                 selection_visible_ = false;
                 edit_mode_ = false;
                 set_search_focused(true);
+                return 0;
+            }
+            if (closing_) {
+                mouse_down_page_ = kNoPage;
+                mouse_down_on_item_ = false;
+                mouse_down_on_background_ = false;
                 return 0;
             }
             if (search_focused_) {
@@ -2271,6 +2385,9 @@ private:
                 update_pointer_selection(
                     GET_X_LPARAM(lparam),
                     GET_Y_LPARAM(lparam));
+            if (mouse_down_on_item_) {
+                begin_root_icon_press(selected_position_);
+            }
             write_drag_diagnostic(
                 L"down",
                 left_mouse_down_x_,
@@ -2293,6 +2410,7 @@ private:
                 LARGE_INTEGER counter{};
                 QueryPerformanceCounter(&counter);
                 drag_press_origin_ = counter.QuadPart;
+                arm_long_press_timer();
                 SetCapture(hwnd_);
             }
             mouse_down_on_background_ =
@@ -2372,11 +2490,16 @@ private:
                 return 0;
             }
             if (folder_drag_candidate_) {
+                cancel_long_press_timer();
                 folder_drag_candidate_ = false;
                 folder_drag_source_position_ = kNoPage;
                 folder_drag_target_position_ = kNoPage;
                 if (GetCapture() == hwnd_) {
+                    preserve_icon_activation_on_capture_change_ =
+                        true;
                     ReleaseCapture();
+                    preserve_icon_activation_on_capture_change_ =
+                        false;
                 }
             }
             if (drag_active_) {
@@ -2409,6 +2532,8 @@ private:
                         x,
                         y)) {
                     close_folder();
+                } else {
+                    cancel_icon_activation(true);
                 }
                 mouse_down_on_folder_item_ = false;
                 mouse_down_on_folder_background_ = false;
@@ -2416,11 +2541,16 @@ private:
                 return 0;
             }
             if (drag_candidate_) {
+                cancel_long_press_timer();
                 drag_candidate_ = false;
                 drag_source_visible_position_ = kNoPage;
                 drag_source_layout_index_ = kNoPage;
                 if (GetCapture() == hwnd_) {
+                    preserve_icon_activation_on_capture_change_ =
+                        true;
                     ReleaseCapture();
+                    preserve_icon_activation_on_capture_change_ =
+                        false;
                 }
             }
             if (page_drag_active_) {
@@ -2516,6 +2646,15 @@ private:
                 } else {
                     request_close();
                 }
+            } else {
+                cancel_icon_activation(true);
+            }
+            if (GetCapture() == hwnd_) {
+                preserve_icon_activation_on_capture_change_ =
+                    icon_activation_.has_value();
+                ReleaseCapture();
+                preserve_icon_activation_on_capture_change_ =
+                    false;
             }
             mouse_down_page_ = kNoPage;
             mouse_down_on_item_ = false;
@@ -2526,6 +2665,9 @@ private:
         case WM_RBUTTONUP:
             return 0;
         case WM_CAPTURECHANGED:
+            if (!preserve_icon_activation_on_capture_change_) {
+                cancel_icon_activation();
+            }
             if (page_drag_active_) {
                 const D2D1_POINT_2F delta = client_delta_to_dips(
                     page_drag_current_x_ - page_drag_start_x_,
@@ -2607,6 +2749,32 @@ private:
                 DestroyWindow(hwnd_);
             }
             return 0;
+        case kFallbackFrameTickMessage: {
+            const LONG generation =
+                static_cast<LONG>(wparam);
+            if (generation != InterlockedCompareExchange(
+                    &fallback_frame_generation_,
+                    0,
+                    0)) {
+                return 0;
+            }
+            if (fallback_frame_timer_id_ != 0 &&
+                frame_pump_active_) {
+                animation_tick();
+            }
+            // Keep the message marked as pending while the UI-thread tick is
+            // running.  Otherwise a slow frame can enqueue another tick
+            // before WM_PAINT is synthesized and starve rendering.
+            if (generation == InterlockedCompareExchange(
+                    &fallback_frame_generation_,
+                    0,
+                    0)) {
+                InterlockedExchange(
+                    &fallback_frame_tick_pending_,
+                    FALSE);
+            }
+            return 0;
+        }
         case kExternalDropCompletedMessage:
             begin_external_drop_rescan(
                 GET_X_LPARAM(lparam),
@@ -3057,48 +3225,274 @@ private:
         icons_pending_ = true;
     }
 
-    bool ensure_device_resources() {
-        if (render_target_) {
+    bool bind_swap_chain_target() {
+        if (!swap_chain_ || !render_target_) {
+            return false;
+        }
+        render_target_->SetTarget(nullptr);
+        swap_chain_bitmap_.Reset();
+
+        ComPtr<IDXGISurface> surface;
+        if (FAILED(swap_chain_->GetBuffer(
+                0,
+                IID_PPV_ARGS(
+                    surface.ReleaseAndGetAddressOf())))) {
+            return false;
+        }
+        const float dpi =
+            static_cast<float>(GetDpiForWindow(hwnd_));
+        const D2D1_BITMAP_PROPERTIES1 properties =
+            D2D1::BitmapProperties1(
+                D2D1_BITMAP_OPTIONS_TARGET |
+                    D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
+                D2D1::PixelFormat(
+                    kSwapChainFormat,
+                    D2D1_ALPHA_MODE_IGNORE),
+                dpi,
+                dpi);
+        if (FAILED(render_target_->CreateBitmapFromDxgiSurface(
+                surface.Get(),
+                &properties,
+                swap_chain_bitmap_.ReleaseAndGetAddressOf()))) {
+            return false;
+        }
+        render_target_->SetTarget(swap_chain_bitmap_.Get());
+        render_target_->SetDpi(dpi, dpi);
+        return true;
+    }
+
+    bool resize_swap_chain(UINT width, UINT height) {
+        if (!swap_chain_ || !render_target_ ||
+            width == 0 || height == 0) {
             return true;
         }
-
-        RECT client{};
-        GetClientRect(hwnd_, &client);
-        const D2D1_SIZE_U size = D2D1::SizeU(
-            static_cast<UINT32>(std::max(1L, client.right)),
-            static_cast<UINT32>(std::max(1L, client.bottom)));
-        if (FAILED(factory_->CreateHwndRenderTarget(
-                D2D1::RenderTargetProperties(),
-                D2D1::HwndRenderTargetProperties(hwnd_, size),
-                render_target_.ReleaseAndGetAddressOf()))) {
-            return false;
-        }
-        const float dpi = static_cast<float>(GetDpiForWindow(hwnd_));
-        render_target_->SetDpi(dpi, dpi);
-        update_icon_request_size(static_cast<UINT>(dpi));
-
-        if (FAILED(render_target_->CreateSolidColorBrush(
-                D2D1::ColorF(0xFFFFFF),
-                white_brush_.ReleaseAndGetAddressOf()))) {
-            return false;
-        }
-        if (FAILED(render_target_->CreateSolidColorBrush(
-                D2D1::ColorF(0x000000),
-                color_brush_.ReleaseAndGetAddressOf()))) {
+        render_target_->SetTarget(nullptr);
+        swap_chain_bitmap_.Reset();
+        background_bitmap_.Reset();
+        const HRESULT resized = swap_chain_->ResizeBuffers(
+            0,
+            width,
+            height,
+            DXGI_FORMAT_UNKNOWN,
+            0);
+        if (FAILED(resized) || !bind_swap_chain_target()) {
+            discard_device_resources();
             return false;
         }
         return true;
     }
 
+    bool ensure_device_resources() {
+        if (render_target_ && swap_chain_) {
+            return true;
+        }
+
+        constexpr std::array<D3D_FEATURE_LEVEL, 4> feature_levels{
+            D3D_FEATURE_LEVEL_11_1,
+            D3D_FEATURE_LEVEL_11_0,
+            D3D_FEATURE_LEVEL_10_1,
+            D3D_FEATURE_LEVEL_10_0,
+        };
+        constexpr UINT device_flags =
+            D3D11_CREATE_DEVICE_BGRA_SUPPORT;
+        HRESULT created = D3D11CreateDevice(
+            nullptr,
+            D3D_DRIVER_TYPE_HARDWARE,
+            nullptr,
+            device_flags,
+            feature_levels.data(),
+            static_cast<UINT>(feature_levels.size()),
+            D3D11_SDK_VERSION,
+            d3d_device_.ReleaseAndGetAddressOf(),
+            &d3d_feature_level_,
+            d3d_context_.ReleaseAndGetAddressOf());
+        using_warp_renderer_ = false;
+        if (created == E_INVALIDARG) {
+            created = D3D11CreateDevice(
+                nullptr,
+                D3D_DRIVER_TYPE_HARDWARE,
+                nullptr,
+                device_flags,
+                feature_levels.data() + 1,
+                static_cast<UINT>(feature_levels.size() - 1),
+                D3D11_SDK_VERSION,
+                d3d_device_.ReleaseAndGetAddressOf(),
+                &d3d_feature_level_,
+                d3d_context_.ReleaseAndGetAddressOf());
+        }
+        if (FAILED(created)) {
+            using_warp_renderer_ = true;
+            created = D3D11CreateDevice(
+                nullptr,
+                D3D_DRIVER_TYPE_WARP,
+                nullptr,
+                device_flags,
+                feature_levels.data() + 1,
+                static_cast<UINT>(feature_levels.size() - 1),
+                D3D11_SDK_VERSION,
+                d3d_device_.ReleaseAndGetAddressOf(),
+                &d3d_feature_level_,
+                d3d_context_.ReleaseAndGetAddressOf());
+        }
+        if (FAILED(created) ||
+            FAILED(d3d_device_.As(&dxgi_device_))) {
+            discard_device_resources();
+            return false;
+        }
+        ComPtr<IDXGIDevice1> latency_device;
+        if (SUCCEEDED(dxgi_device_.As(&latency_device))) {
+            latency_device->SetMaximumFrameLatency(1);
+        }
+        if (FAILED(factory_->CreateDevice(
+                dxgi_device_.Get(),
+                d2d_device_.ReleaseAndGetAddressOf())) ||
+            FAILED(d2d_device_->CreateDeviceContext(
+                D2D1_DEVICE_CONTEXT_OPTIONS_NONE,
+                render_target_.ReleaseAndGetAddressOf()))) {
+            discard_device_resources();
+            return false;
+        }
+
+        ComPtr<IDXGIAdapter> adapter;
+        ComPtr<IDXGIFactory2> dxgi_factory;
+        if (FAILED(dxgi_device_->GetAdapter(
+                adapter.ReleaseAndGetAddressOf())) ||
+            FAILED(adapter->GetParent(
+                IID_PPV_ARGS(
+                    dxgi_factory.ReleaseAndGetAddressOf())))) {
+            discard_device_resources();
+            return false;
+        }
+        RECT client{};
+        GetClientRect(hwnd_, &client);
+        const UINT width =
+            static_cast<UINT>(std::max(1L, client.right));
+        const UINT height =
+            static_cast<UINT>(std::max(1L, client.bottom));
+        const DXGI_SWAP_CHAIN_DESC1 description{
+            .Width = width,
+            .Height = height,
+            .Format = kSwapChainFormat,
+            .Stereo = FALSE,
+            .SampleDesc = DXGI_SAMPLE_DESC{
+                .Count = 1,
+                .Quality = 0,
+            },
+            .BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT,
+            .BufferCount = 2,
+            .Scaling = DXGI_SCALING_STRETCH,
+            .SwapEffect = DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL,
+            .AlphaMode = DXGI_ALPHA_MODE_IGNORE,
+            .Flags = 0,
+        };
+        if (FAILED(dxgi_factory->CreateSwapChainForComposition(
+                d3d_device_.Get(),
+                &description,
+                nullptr,
+                swap_chain_.ReleaseAndGetAddressOf()))) {
+            discard_device_resources();
+            return false;
+        }
+        ComPtr<IDXGISwapChain2> latency_swap_chain;
+        if (SUCCEEDED(swap_chain_.As(&latency_swap_chain))) {
+            latency_swap_chain->SetMaximumFrameLatency(1);
+        }
+        if (!bind_swap_chain_target()) {
+            discard_device_resources();
+            return false;
+        }
+
+        if (FAILED(DCompositionCreateDevice(
+                dxgi_device_.Get(),
+                IID_PPV_ARGS(
+                    composition_device_.ReleaseAndGetAddressOf()))) ||
+            FAILED(composition_device_->CreateTargetForHwnd(
+                hwnd_,
+                TRUE,
+                composition_target_.ReleaseAndGetAddressOf())) ||
+            FAILED(composition_device_->CreateVisual(
+                composition_visual_.ReleaseAndGetAddressOf())) ||
+            FAILED(composition_visual_->SetContent(
+                swap_chain_.Get())) ||
+            FAILED(composition_target_->SetRoot(
+                composition_visual_.Get())) ||
+            FAILED(composition_device_->Commit())) {
+            discard_device_resources();
+            return false;
+        }
+
+        const float dpi =
+            static_cast<float>(GetDpiForWindow(hwnd_));
+        update_icon_request_size(static_cast<UINT>(dpi));
+        if (FAILED(render_target_->CreateSolidColorBrush(
+                D2D1::ColorF(0xFFFFFF),
+                white_brush_.ReleaseAndGetAddressOf())) ||
+            FAILED(render_target_->CreateSolidColorBrush(
+                D2D1::ColorF(0x000000),
+                color_brush_.ReleaseAndGetAddressOf()))) {
+            discard_device_resources();
+            return false;
+        }
+
+        DXGI_ADAPTER_DESC adapter_description{};
+        if (FAILED(adapter->GetDesc(&adapter_description))) {
+            wcscpy_s(
+                adapter_description.Description,
+                L"unknown");
+        }
+        std::wstring synchronization =
+            using_warp_renderer_
+            ? L"WARP D3D11/D2D/DComp"
+            : L"HW D3D11/D2D/DComp";
+        synchronization +=
+            L" + DXGI flip Present(0) + ";
+        synchronization += frame_timer_
+            ? L"QPC waitable"
+            : L"multimedia fallback";
+        const std::wstring frame_log_path =
+            (applications_directory_.parent_path() /
+             L"LaunchpadFrame.log").wstring();
+        frame_diagnostics_.configure(
+            launchpad::FrameDiagnosticsConfig{
+                .enabled = diagnostics_enabled_,
+                .adapter_name =
+                    adapter_description.Description,
+                .target_refresh_hz =
+                    static_cast<double>(query_refresh_rate()),
+                .synchronization =
+                    synchronization.c_str(),
+                .output_file_path =
+                    frame_log_path.c_str(),
+            });
+        return true;
+    }
+
     void discard_device_resources() {
+        frame_diagnostics_.flush();
         for (AppEntry& app : apps_) {
             app.icon.Reset();
             app.icon_attempted = false;
         }
+        if (render_target_) {
+            render_target_->SetTarget(nullptr);
+        }
+        if (composition_visual_) {
+            composition_visual_->SetContent(nullptr);
+        }
         color_brush_.Reset();
         white_brush_.Reset();
         background_bitmap_.Reset();
+        swap_chain_bitmap_.Reset();
         render_target_.Reset();
+        d2d_device_.Reset();
+        composition_visual_.Reset();
+        composition_target_.Reset();
+        composition_device_.Reset();
+        swap_chain_.Reset();
+        dxgi_device_.Reset();
+        d3d_context_.Reset();
+        d3d_device_.Reset();
+        icons_pending_ = true;
     }
 
     bool ensure_icon(AppEntry& app) {
@@ -3203,6 +3597,8 @@ private:
             return;
         }
 
+        frame_diagnostics_.begin_frame();
+        frame_diagnostics_.begin_update();
         const float opening_progress = animations_enabled_
             ? std::clamp(
                   spring_ease_out(static_cast<float>(
@@ -3230,6 +3626,8 @@ private:
                     folder_closing_
                 ? 0
                 : 1;
+        frame_diagnostics_.end_update();
+        frame_diagnostics_.begin_draw();
         render_target_->BeginDraw();
         render_target_->SetTransform(D2D1::Matrix3x2F::Identity());
         render_target_->Clear(D2D1::ColorF(0x0B0B0D));
@@ -3272,7 +3670,47 @@ private:
         }
 
         const HRESULT result = render_target_->EndDraw();
+        frame_diagnostics_.end_draw();
+        HRESULT presented = result;
+        DXGI_FRAME_STATISTICS statistics{};
+        HRESULT statistics_result = E_PENDING;
+        frame_diagnostics_.begin_present();
+        if (SUCCEEDED(result) && swap_chain_) {
+            presented = swap_chain_->Present(
+                kPresentSyncInterval,
+                0);
+        }
+        frame_diagnostics_.end_present(presented);
+        if (SUCCEEDED(presented) && swap_chain_) {
+            first_frame_presented_ = true;
+            if (uncloak_after_first_present_) {
+                DwmFlush();
+                const BOOL uncloak = FALSE;
+                if (SUCCEEDED(DwmSetWindowAttribute(
+                        hwnd_,
+                        DWMWA_CLOAK,
+                        &uncloak,
+                        sizeof(uncloak)))) {
+                    uncloak_after_first_present_ = false;
+                }
+            }
+            if (frame_diagnostics_.enabled()) {
+                statistics_result =
+                    swap_chain_->GetFrameStatistics(&statistics);
+            }
+        }
+        frame_diagnostics_.record_frame_statistics(
+            statistics_result,
+            SUCCEEDED(statistics_result)
+                ? &statistics
+                : nullptr);
+        frame_diagnostics_.end_frame();
+
         if (result == D2DERR_RECREATE_TARGET) {
+            discard_device_resources();
+        } else if (
+            presented == DXGI_ERROR_DEVICE_REMOVED ||
+            presented == DXGI_ERROR_DEVICE_RESET) {
             discard_device_resources();
         }
         EndPaint(hwnd_, &paint_struct);
@@ -4294,14 +4732,34 @@ private:
                     (1.0F - child_delay),
                 0.0F,
                 1.0F);
-            const D2D1_RECT_F icon_rect = lerp_rect(
+            const D2D1_RECT_F interaction_icon_rect = lerp_rect(
                 source_icon_rect,
                 target_icon_rect,
                 child_progress);
             const float animated_center_x =
-                (icon_rect.left + icon_rect.right) * 0.5F;
+                (interaction_icon_rect.left +
+                 interaction_icon_rect.right) * 0.5F;
             const float animated_center_y =
-                (icon_rect.top + icon_rect.bottom) * 0.5F;
+                (interaction_icon_rect.top +
+                 interaction_icon_rect.bottom) * 0.5F;
+            const float activation_scale =
+                folder_icon_activation_scale(
+                    folder->children[position]);
+            const float interaction_half_width =
+                (interaction_icon_rect.right -
+                 interaction_icon_rect.left) * 0.5F;
+            const float interaction_half_height =
+                (interaction_icon_rect.bottom -
+                 interaction_icon_rect.top) * 0.5F;
+            const D2D1_RECT_F icon_rect = D2D1::RectF(
+                animated_center_x -
+                    interaction_half_width * activation_scale,
+                animated_center_y -
+                    interaction_half_height * activation_scale,
+                animated_center_x +
+                    interaction_half_width * activation_scale,
+                animated_center_y +
+                    interaction_half_height * activation_scale);
             const float item_opacity =
                 (local < 9 && folder_page_ == 0
                      ? visibility
@@ -4394,8 +4852,8 @@ private:
             if (interactions_ready &&
                 !folder_drag_reflow_active_) {
                 folder_hit_regions_.push_back(HitRegion{
-                    .bounds = icon_rect,
-                    .icon_bounds = icon_rect,
+                    .bounds = interaction_icon_rect,
+                    .icon_bounds = interaction_icon_rect,
                     .visible_position = position,
                 });
             }
@@ -4716,6 +5174,231 @@ private:
                 launchpad::lowercase(folder.children.front());
         }
         return key;
+    }
+
+    float current_icon_activation_scale() const {
+        if (!icon_activation_ || !animations_enabled_) {
+            return 1.0F;
+        }
+        const IconActivation& activation = *icon_activation_;
+        if (activation.phase == IconActivationPhase::pressed) {
+            const float progress = ease_out_cubic(
+                static_cast<float>(
+                    elapsed_since(activation.phase_origin) /
+                    kIconPressSeconds));
+            return lerp(1.0F, kIconPressedScale, progress);
+        }
+        if (activation.phase != IconActivationPhase::released) {
+            return 1.0F;
+        }
+
+        const float progress = std::clamp(
+            static_cast<float>(
+                elapsed_since(activation.phase_origin) /
+                kIconReleaseSeconds),
+            0.0F,
+            1.0F);
+        if (progress < 0.38F) {
+            return lerp(
+                activation.release_from_scale,
+                kIconReleasePeakScale,
+                smooth_step(progress / 0.38F));
+        }
+        if (progress < 0.68F) {
+            return lerp(
+                kIconReleasePeakScale,
+                kIconReleaseDipScale,
+                smooth_step((progress - 0.38F) / 0.30F));
+        }
+        return lerp(
+            kIconReleaseDipScale,
+            1.0F,
+            smooth_step((progress - 0.68F) / 0.32F));
+    }
+
+    float root_icon_activation_scale(
+        const VisibleItem& visible) const {
+        if (!icon_activation_ ||
+            icon_activation_->surface !=
+                IconActivationSurface::root ||
+            icon_activation_->visual_key !=
+                root_visual_key(visible)) {
+            return 1.0F;
+        }
+        return current_icon_activation_scale();
+    }
+
+    float folder_icon_activation_scale(
+        std::wstring_view app_path) const {
+        if (!icon_activation_ ||
+            icon_activation_->surface !=
+                IconActivationSurface::folder ||
+            launchpad::lowercase(app_path) !=
+                icon_activation_->app_path) {
+            return 1.0F;
+        }
+        return current_icon_activation_scale();
+    }
+
+    bool begin_root_icon_press(std::size_t position) {
+        if (position >= visible_items_.size() ||
+            closing_) {
+            return false;
+        }
+        const VisibleItem& visible = visible_items_[position];
+        IconActivation activation{
+            .surface = IconActivationSurface::root,
+            .phase = IconActivationPhase::pressed,
+            .kind = visible.kind,
+            .visual_key = root_visual_key(visible),
+        };
+        if (activation.visual_key.empty()) {
+            return false;
+        }
+        if (visible.kind == VisibleItemKind::app) {
+            const AppEntry* app = app_for_visible(visible);
+            if (!app) {
+                return false;
+            }
+            activation.app_path =
+                launchpad::lowercase(app->path);
+        } else {
+            activation.folder_layout_index =
+                visible.layout_index;
+        }
+        LARGE_INTEGER counter{};
+        QueryPerformanceCounter(&counter);
+        activation.phase_origin = counter.QuadPart;
+        icon_activation_ = std::move(activation);
+        InvalidateRect(hwnd_, nullptr, FALSE);
+        return true;
+    }
+
+    bool begin_folder_icon_press(std::size_t position) {
+        if (open_folder_index_ >= layout_.items().size() ||
+            folder_closing_ || closing_) {
+            return false;
+        }
+        const launchpad::LayoutItem& folder =
+            layout_.items()[open_folder_index_];
+        if (folder.kind != launchpad::LayoutItemKind::folder ||
+            position >= folder.children.size()) {
+            return false;
+        }
+        IconActivation activation{
+            .surface = IconActivationSurface::folder,
+            .phase = IconActivationPhase::pressed,
+            .kind = VisibleItemKind::app,
+            .app_path =
+                launchpad::lowercase(folder.children[position]),
+        };
+        LARGE_INTEGER counter{};
+        QueryPerformanceCounter(&counter);
+        activation.phase_origin = counter.QuadPart;
+        icon_activation_ = std::move(activation);
+        InvalidateRect(hwnd_, nullptr, FALSE);
+        return true;
+    }
+
+    void update_icon_press_movement(int x, int y) {
+        if (!icon_activation_ ||
+            icon_activation_->phase !=
+                IconActivationPhase::pressed ||
+            icon_activation_->moved_beyond_click_slop) {
+            return;
+        }
+        if (!is_click_without_drag(
+                left_mouse_down_x_,
+                left_mouse_down_y_,
+                x,
+                y)) {
+            icon_activation_->moved_beyond_click_slop = true;
+        }
+    }
+
+    void release_icon_activation(bool dispatch_requested) {
+        if (!icon_activation_) {
+            return;
+        }
+        if (icon_activation_->moved_beyond_click_slop) {
+            dispatch_requested = false;
+        }
+        if (!animations_enabled_) {
+            icon_activation_->dispatch_requested =
+                dispatch_requested;
+            if (dispatch_requested) {
+                dispatch_icon_activation();
+            }
+            icon_activation_.reset();
+            return;
+        }
+        icon_activation_->release_from_scale =
+            current_icon_activation_scale();
+        icon_activation_->phase =
+            IconActivationPhase::released;
+        icon_activation_->dispatch_requested =
+            dispatch_requested;
+        icon_activation_->action_dispatched = false;
+        LARGE_INTEGER counter{};
+        QueryPerformanceCounter(&counter);
+        icon_activation_->phase_origin = counter.QuadPart;
+        InvalidateRect(hwnd_, nullptr, FALSE);
+    }
+
+    void cancel_icon_activation(bool animate_release = false) {
+        if (!icon_activation_) {
+            return;
+        }
+        if (animate_release &&
+            icon_activation_->phase ==
+                IconActivationPhase::pressed &&
+            animations_enabled_) {
+            release_icon_activation(false);
+            return;
+        }
+        icon_activation_.reset();
+        InvalidateRect(hwnd_, nullptr, FALSE);
+    }
+
+    void dispatch_icon_activation() {
+        if (!icon_activation_ ||
+            !icon_activation_->dispatch_requested ||
+            icon_activation_->action_dispatched) {
+            return;
+        }
+        icon_activation_->action_dispatched = true;
+        const IconActivation activation = *icon_activation_;
+        if (activation.surface == IconActivationSurface::root &&
+            activation.kind == VisibleItemKind::folder) {
+            open_folder(activation.folder_layout_index);
+            return;
+        }
+        const std::size_t app_index =
+            app_index_for_path(activation.app_path);
+        if (app_index == kNoPage) {
+            return;
+        }
+        launch_app(apps_[app_index]);
+    }
+
+    void advance_icon_activation() {
+        if (!icon_activation_) {
+            return;
+        }
+        if (icon_activation_->phase ==
+            IconActivationPhase::released) {
+            const double elapsed =
+                elapsed_since(icon_activation_->phase_origin);
+            if (icon_activation_->dispatch_requested &&
+                !icon_activation_->action_dispatched &&
+                elapsed >= kIconActionDelaySeconds) {
+                dispatch_icon_activation();
+            }
+            if (icon_activation_ &&
+                elapsed >= kIconReleaseSeconds) {
+                icon_activation_.reset();
+            }
+        }
     }
 
     bool root_live_reorder_active(
@@ -5073,7 +5756,7 @@ private:
                         pi * current_folder_drop_progress()) *
                         0.075F
                 : 1.0F;
-            const float scale =
+            const float base_scale =
                 motion_scale *
                 accept_pulse *
                 (folder_drop_target
@@ -5081,15 +5764,27 @@ private:
                      : (folder_intent_target
                             ? 1.065F
                             : (selected ? 1.035F : 1.0F)));
+            const float activation_scale =
+                root_icon_activation_scale(visible);
+            const float scale =
+                base_scale * activation_scale;
             const float item_opacity =
                 base_item_opacity *
                 (drag_source ? 0.06F : 1.0F);
             const float half = icon_size * scale * 0.5F;
+            const float interaction_half =
+                icon_size * base_scale * 0.5F;
             const D2D1_RECT_F icon_rect = D2D1::RectF(
                 center_x - half,
                 center_y - half,
                 center_x + half,
                 center_y + half);
+            const D2D1_RECT_F interaction_icon_rect =
+                D2D1::RectF(
+                    center_x - interaction_half,
+                    center_y - interaction_half,
+                    center_x + interaction_half,
+                    center_y + interaction_half);
             const float actual_icon_size =
                 icon_rect.right - icon_rect.left;
             const D2D1_ROUNDED_RECT rounded_icon{
@@ -5303,9 +5998,9 @@ private:
 
             const D2D1_RECT_F label = D2D1::RectF(
                 center_x - cell_width * 0.46F,
-                center_y + half + 9.0F,
+                center_y + interaction_half + 9.0F,
                 center_x + cell_width * 0.46F,
-                center_y + half + 34.0F);
+                center_y + interaction_half + 34.0F);
             white_brush_->SetOpacity(0.94F * item_opacity);
             render_target_->DrawTextW(
                 folder ? folder->name.c_str() : app->name.c_str(),
@@ -5318,8 +6013,8 @@ private:
 
             if (register_hit_regions) {
                 hit_regions_.push_back(HitRegion{
-                    .bounds = icon_rect,
-                    .icon_bounds = icon_rect,
+                    .bounds = interaction_icon_rect,
+                    .icon_bounds = interaction_icon_rect,
                     .visible_position = position,
                 });
                 root_drop_regions_.push_back(HitRegion{
@@ -5787,6 +6482,23 @@ private:
             }
             return true;
         }
+        if (key == VK_ESCAPE &&
+            icon_activation_ &&
+            icon_activation_->phase ==
+                IconActivationPhase::pressed) {
+            cancel_icon_activation();
+            mouse_down_on_item_ = false;
+            mouse_down_on_folder_item_ = false;
+            if (GetCapture() == hwnd_) {
+                ReleaseCapture();
+            }
+            return true;
+        }
+        if (icon_activation_ &&
+            icon_activation_->phase ==
+                IconActivationPhase::released) {
+            cancel_icon_activation();
+        }
         if (drag_active_ || drag_candidate_ ||
             folder_drag_active_ || folder_drag_candidate_) {
             return true;
@@ -6202,12 +6914,16 @@ private:
     }
 
     void accumulate_wheel(int delta, bool horizontal) {
+        if (page_transition_active_ || closing_) {
+            vertical_wheel_remainder_ = 0;
+            horizontal_wheel_remainder_ = 0;
+            return;
+        }
         int& remainder = horizontal
             ? horizontal_wheel_remainder_
             : vertical_wheel_remainder_;
         remainder += delta;
-        if (std::abs(remainder) < WHEEL_DELTA ||
-            page_transition_active_) {
+        if (std::abs(remainder) < WHEEL_DELTA) {
             return;
         }
         if (horizontal) {
@@ -6294,6 +7010,8 @@ private:
             (std::abs(target - start) > 0.01F ||
              std::abs(page_transition_initial_velocity_) >
                  kPageSettleVelocityDipsPerSecond);
+        vertical_wheel_remainder_ = 0;
+        horizontal_wheel_remainder_ = 0;
     }
 
     void reset_page_motion() {
@@ -6454,7 +7172,61 @@ private:
         }
     }
 
+    void arm_long_press_timer() {
+        KillTimer(hwnd_, kLongPressTimer);
+        SetTimer(
+            hwnd_,
+            kLongPressTimer,
+            static_cast<UINT>(
+                std::ceil(kLongPressSeconds * 1000.0)),
+            nullptr);
+    }
+
+    void handle_long_press_timer() {
+        KillTimer(hwnd_, kLongPressTimer);
+        const bool folder_press = folder_drag_candidate_;
+        if (!folder_press && !drag_candidate_) {
+            return;
+        }
+        if ((GetAsyncKeyState(VK_LBUTTON) & 0x8000) == 0) {
+            cancel_drag();
+            cancel_folder_drag();
+            return;
+        }
+        const std::int64_t origin = folder_press
+            ? folder_drag_press_origin_
+            : drag_press_origin_;
+        const double elapsed = elapsed_since(origin);
+        if (elapsed + 0.001 < kLongPressSeconds) {
+            const UINT remaining_ms =
+                std::max<UINT>(
+                    1,
+                    static_cast<UINT>(std::ceil(
+                        (kLongPressSeconds - elapsed) *
+                        1000.0)));
+            SetTimer(
+                hwnd_,
+                kLongPressTimer,
+                remaining_ms,
+                nullptr);
+            return;
+        }
+        if (folder_press) {
+            start_folder_drag();
+        } else {
+            start_drag();
+        }
+    }
+
+    void cancel_long_press_timer() {
+        if (hwnd_) {
+            KillTimer(hwnd_, kLongPressTimer);
+        }
+    }
+
     void start_folder_drag() {
+        cancel_long_press_timer();
+        cancel_icon_activation();
         if (!folder_drag_candidate_ ||
             open_folder_index_ >= layout_.items().size() ||
             folder_closing_ || closing_) {
@@ -6696,6 +7468,8 @@ private:
     }
 
     void cancel_folder_drag() {
+        cancel_long_press_timer();
+        cancel_icon_activation();
         folder_drag_active_ = false;
         folder_drag_candidate_ = false;
         folder_drag_source_position_ = kNoPage;
@@ -6706,6 +7480,8 @@ private:
     }
 
     void start_drag() {
+        cancel_long_press_timer();
+        cancel_icon_activation();
         if (!drag_candidate_ ||
             drag_source_visible_position_ >= visible_items_.size() ||
             drag_source_layout_index_ >= layout_.items().size() ||
@@ -7151,6 +7927,8 @@ private:
     }
 
     void cancel_drag() {
+        cancel_long_press_timer();
+        cancel_icon_activation();
         const bool restore_source_page = drag_active_;
         const bool restore_extraction =
             folder_extraction_.has_value();
@@ -7253,18 +8031,32 @@ private:
         if (open_folder_index_ >= layout_.items().size() ||
             folder_closing_ ||
             closing_) {
+            cancel_icon_activation(true);
             return;
         }
         const launchpad::LayoutItem& folder =
             layout_.items()[open_folder_index_];
         if (folder_selected_position_ >= folder.children.size()) {
+            cancel_icon_activation(true);
             return;
         }
         const std::size_t app_index = app_index_for_path(
             folder.children[folder_selected_position_]);
         if (app_index == kNoPage) {
+            cancel_icon_activation(true);
             return;
         }
+        const std::wstring app_path =
+            launchpad::lowercase(
+                folder.children[folder_selected_position_]);
+        if (!icon_activation_ ||
+            icon_activation_->surface !=
+                IconActivationSurface::folder ||
+            icon_activation_->app_path != app_path) {
+            begin_folder_icon_press(
+                folder_selected_position_);
+        }
+        release_icon_activation(false);
         launch_app(apps_[app_index]);
     }
 
@@ -7798,7 +8590,7 @@ private:
     void launch_app(const AppEntry& app) {
         SHELLEXECUTEINFOW execute_info{
             .cbSize = sizeof(SHELLEXECUTEINFOW),
-            .fMask = SEE_MASK_FLAG_NO_UI | SEE_MASK_NOASYNC,
+            .fMask = SEE_MASK_FLAG_NO_UI | SEE_MASK_ASYNCOK,
             .hwnd = hwnd_,
             .lpVerb = L"open",
             .lpFile = app.path.c_str(),
@@ -7816,11 +8608,7 @@ private:
                 MB_OK | MB_ICONERROR);
             return;
         }
-        set_search_focused(false, false);
-        search_.clear();
-        search_all_selected_ = false;
-        finish_folder_close();
-        rebuild_filter();
+        launch_cleanup_pending_ = true;
         request_close();
     }
 
@@ -7830,16 +8618,27 @@ private:
             page_transition_active_ ||
             page_drag_active_ ||
             closing_) {
+            cancel_icon_activation(true);
             return;
         }
         const VisibleItem& visible =
             visible_items_[selected_position_];
+        const std::wstring visual_key =
+            root_visual_key(visible);
+        if (!icon_activation_ ||
+            icon_activation_->surface !=
+                IconActivationSurface::root ||
+            icon_activation_->visual_key != visual_key) {
+            begin_root_icon_press(selected_position_);
+        }
+        release_icon_activation(false);
         if (visible.kind == VisibleItemKind::folder) {
             open_folder(visible.layout_index);
             return;
         }
         const AppEntry* app = app_for_visible(visible);
         if (!app) {
+            cancel_icon_activation(true);
             return;
         }
         launch_app(*app);
@@ -8159,7 +8958,8 @@ private:
             folder_drop_animation_active_ ||
             root_reflow_animation_active_ ||
             root_drag_reflow_active_ ||
-            folder_drag_reflow_active_) {
+            folder_drag_reflow_active_ ||
+            icon_activation_) {
             return;
         }
         const auto signature =
@@ -8260,6 +9060,7 @@ private:
         if (delete_confirmation_active_) {
             dismiss_delete_confirmation();
         }
+        cancel_icon_activation();
         closing_ = false;
         edit_mode_ = false;
         set_search_focused(false, false);
@@ -8276,6 +9077,14 @@ private:
                 SWP_NOACTIVATE | SWP_NOZORDER);
         }
         reset_animation_clock();
+        diagnostic_autoplay_origin_ = clock_origin_;
+        diagnostic_icon_autoplay_origin_ = clock_origin_;
+        diagnostic_icon_press_pending_ = false;
+        diagnostic_icon_position_ = kNoPage;
+        diagnostic_autoplay_direction_ =
+            current_page_ + 1 < effective_page_count()
+            ? 1
+            : -1;
         intro_complete_ = !animations_enabled_;
         if (was_hidden) {
             const BOOL cloak = TRUE;
@@ -8285,6 +9094,8 @@ private:
                     DWMWA_CLOAK,
                     &cloak,
                     sizeof(cloak)));
+            first_frame_presented_ = false;
+            uncloak_after_first_present_ = cloak_enabled;
             SetWindowPos(
                 hwnd_,
                 HWND_TOP,
@@ -8300,15 +9111,16 @@ private:
                 nullptr,
                 RDW_INVALIDATE | RDW_UPDATENOW |
                     RDW_NOERASE);
-            reset_animation_clock();
-            if (cloak_enabled) {
-                const BOOL uncloak = FALSE;
-                DwmSetWindowAttribute(
+            if (!first_frame_presented_) {
+                discard_device_resources();
+                RedrawWindow(
                     hwnd_,
-                    DWMWA_CLOAK,
-                    &uncloak,
-                    sizeof(uncloak));
+                    nullptr,
+                    nullptr,
+                    RDW_INVALIDATE | RDW_UPDATENOW |
+                        RDW_NOERASE);
             }
+            reset_animation_clock();
         } else {
             SetWindowPos(
                 hwnd_,
@@ -8328,6 +9140,11 @@ private:
     void request_close() {
         if (closing_ || !IsWindowVisible(hwnd_)) {
             return;
+        }
+        if (icon_activation_ &&
+            icon_activation_->phase !=
+                IconActivationPhase::released) {
+            cancel_icon_activation();
         }
         if (delete_confirmation_active_) {
             dismiss_delete_confirmation();
@@ -8364,15 +9181,29 @@ private:
         mouse_down_page_ = kNoPage;
         hit_regions_.clear();
         if (GetCapture() == hwnd_) {
+            preserve_icon_activation_on_capture_change_ =
+                icon_activation_.has_value();
             ReleaseCapture();
+            preserve_icon_activation_on_capture_change_ = false;
         }
         InvalidateRect(hwnd_, nullptr, FALSE);
     }
 
     void finish_close() {
+        frame_diagnostics_.flush();
+        icon_activation_.reset();
         closing_ = false;
         edit_mode_ = false;
         set_search_focused(false, false);
+        if (launch_cleanup_pending_) {
+            search_.clear();
+            search_all_selected_ = false;
+            launch_cleanup_pending_ = false;
+            if (open_folder_index_ != kNoPage) {
+                finish_folder_close();
+            }
+            rebuild_filter();
+        }
         if (delete_confirmation_active_) {
             dismiss_delete_confirmation();
         }
@@ -8426,6 +9257,61 @@ private:
     void animation_tick() {
         if (!IsWindowVisible(hwnd_)) {
             return;
+        }
+
+        advance_icon_activation();
+        if (diagnostic_icon_autoplay_ &&
+            intro_complete_ &&
+            !closing_ &&
+            !page_transition_active_ &&
+            !page_drag_active_ &&
+            !drag_active_ &&
+            !drag_candidate_ &&
+            !folder_drag_active_ &&
+            !folder_drag_candidate_ &&
+            open_folder_index_ == kNoPage) {
+            if (diagnostic_icon_press_pending_ &&
+                icon_activation_ &&
+                icon_activation_->phase ==
+                    IconActivationPhase::pressed &&
+                elapsed_since(
+                    diagnostic_icon_autoplay_origin_) >=
+                    0.09) {
+                release_icon_activation(false);
+                diagnostic_icon_press_pending_ = false;
+                LARGE_INTEGER counter{};
+                QueryPerformanceCounter(&counter);
+                diagnostic_icon_autoplay_origin_ =
+                    counter.QuadPart;
+            } else if (
+                !diagnostic_icon_press_pending_ &&
+                !icon_activation_ &&
+                elapsed_since(
+                    diagnostic_icon_autoplay_origin_) >=
+                    0.35) {
+                const auto [first, last] =
+                    visible_page_range(current_page_);
+                if (first < last) {
+                    if (diagnostic_icon_position_ < first ||
+                        diagnostic_icon_position_ >= last) {
+                        diagnostic_icon_position_ = first;
+                    }
+                    selected_position_ =
+                        diagnostic_icon_position_;
+                    if (begin_root_icon_press(
+                            diagnostic_icon_position_)) {
+                        diagnostic_icon_press_pending_ = true;
+                        diagnostic_icon_position_ =
+                            diagnostic_icon_position_ + 1 < last
+                            ? diagnostic_icon_position_ + 1
+                            : first;
+                        LARGE_INTEGER counter{};
+                        QueryPerformanceCounter(&counter);
+                        diagnostic_icon_autoplay_origin_ =
+                            counter.QuadPart;
+                    }
+                }
+            }
         }
 
         if (folder_drop_animation_active_ &&
@@ -8487,6 +9373,34 @@ private:
             maybe_advance_drag_page();
             maybe_activate_folder_hover();
         }
+        if (diagnostic_autoplay_ &&
+            !diagnostic_icon_autoplay_ &&
+            intro_complete_ &&
+            !closing_ &&
+            !page_transition_active_ &&
+            !page_drag_active_ &&
+            !drag_active_ &&
+            !drag_candidate_ &&
+            !folder_drag_active_ &&
+            !folder_drag_candidate_ &&
+            !icon_activation_ &&
+            open_folder_index_ == kNoPage &&
+            effective_page_count() > 1 &&
+            elapsed_since(diagnostic_autoplay_origin_) >=
+                0.10) {
+            if (current_page_ == 0) {
+                diagnostic_autoplay_direction_ = 1;
+            } else if (
+                current_page_ + 1 >=
+                effective_page_count()) {
+                diagnostic_autoplay_direction_ = -1;
+            }
+            change_page(diagnostic_autoplay_direction_);
+            LARGE_INTEGER counter{};
+            QueryPerformanceCounter(&counter);
+            diagnostic_autoplay_origin_ =
+                counter.QuadPart;
+        }
 
         if (closing_ &&
             elapsed_since(close_animation_origin_) >=
@@ -8506,7 +9420,8 @@ private:
               folder_name_editing_ ||
               folder_drop_animation_active_ ||
               root_reflow_animation_active_ ||
-              search_focus_animation_active_)) ||
+              search_focus_animation_active_ ||
+              icon_activation_)) ||
             page_drag_active_ ||
             drag_active_ ||
             folder_drag_active_ ||
@@ -8524,7 +9439,7 @@ private:
                     1000.0 /
                     static_cast<double>(refresh_rate)),
                 2L,
-                16L));
+                50L));
         frame_period_qpc_ = std::max<std::int64_t>(
             1,
             static_cast<std::int64_t>(std::llround(
@@ -8594,14 +9509,37 @@ private:
     }
 
     void start_fallback_frame_timer() {
+        update_frame_timing();
+        InterlockedIncrement(
+            &fallback_frame_generation_);
+        InterlockedExchange(
+            &fallback_frame_tick_pending_,
+            FALSE);
+        if (!timer_period_raised_ &&
+            timeBeginPeriod(1) == TIMERR_NOERROR) {
+            timer_period_raised_ = true;
+        }
         frame_pump_active_ =
-            SetTimer(
-                hwnd_,
-                kAnimationTimer,
-                std::max<UINT>(
-                    USER_TIMER_MINIMUM,
-                    fallback_frame_interval_ms_),
-                nullptr) != 0;
+            (fallback_frame_timer_id_ = timeSetEvent(
+                fallback_frame_interval_ms_,
+                1,
+                &LaunchpadWindow::
+                    fallback_frame_timer_callback,
+                reinterpret_cast<DWORD_PTR>(this),
+                TIME_PERIODIC |
+                    TIME_CALLBACK_FUNCTION |
+                    TIME_KILL_SYNCHRONOUS)) != 0;
+        if (!frame_pump_active_) {
+            fallback_frame_timer_id_ = 0;
+            frame_pump_active_ =
+                SetTimer(
+                    hwnd_,
+                    kAnimationTimer,
+                    std::max<UINT>(
+                        USER_TIMER_MINIMUM,
+                        fallback_frame_interval_ms_),
+                    nullptr) != 0;
+        }
     }
 
     bool replace_with_standard_frame_timer(
@@ -8680,10 +9618,25 @@ private:
 
     void stop_frame_pump() {
         frame_pump_active_ = false;
+        InterlockedIncrement(
+            &fallback_frame_generation_);
+        if (fallback_frame_timer_id_ != 0) {
+            const MMRESULT timer =
+                fallback_frame_timer_id_;
+            fallback_frame_timer_id_ = 0;
+            timeKillEvent(timer);
+        }
+        InterlockedExchange(
+            &fallback_frame_tick_pending_,
+            FALSE);
         if (frame_timer_) {
             CancelWaitableTimer(frame_timer_);
         } else if (hwnd_) {
             KillTimer(hwnd_, kAnimationTimer);
+        }
+        if (timer_period_raised_) {
+            timeEndPeriod(1);
+            timer_period_raised_ = false;
         }
     }
 
@@ -8791,6 +9744,11 @@ private:
     HWND hwnd_ = nullptr;
     bool background_mode_ = false;
     bool diagnostics_enabled_ = false;
+    bool diagnostic_autoplay_ = false;
+    bool diagnostic_icon_autoplay_ = false;
+    bool diagnostic_icon_press_pending_ = false;
+    bool launch_cleanup_pending_ = false;
+    bool using_warp_renderer_ = false;
     bool animations_enabled_ = true;
     bool intro_complete_ = false;
     bool page_transition_active_ = false;
@@ -8823,6 +9781,8 @@ private:
     bool folder_panel_bounds_valid_ = false;
     bool folder_origin_bounds_valid_ = false;
     bool icons_pending_ = true;
+    bool first_frame_presented_ = false;
+    bool uncloak_after_first_present_ = false;
     bool frame_pump_active_ = false;
     bool timer_period_raised_ = false;
     bool external_drop_target_registered_ = false;
@@ -8830,6 +9790,7 @@ private:
     bool search_focused_ = false;
     bool search_focus_animation_active_ = false;
     bool search_caret_delayed_reveal_ = false;
+    bool preserve_icon_activation_on_capture_change_ = false;
     std::wstring search_;
     std::wstring folder_name_buffer_;
     std::wstring folder_drop_animation_path_;
@@ -8866,6 +9827,7 @@ private:
     std::optional<launchpad::LayoutItem> folder_closing_visual_;
     std::optional<FolderExtractionTransaction> folder_extraction_;
     std::optional<PendingExternalDrop> pending_external_drop_;
+    std::optional<IconActivation> icon_activation_;
     std::size_t current_page_ = 0;
     std::size_t transition_from_page_ = 0;
     std::size_t page_transition_neighbor_page_ = kNoPage;
@@ -8878,6 +9840,7 @@ private:
     std::size_t mouse_down_delete_position_ = kNoPage;
     std::size_t mouse_down_folder_delete_position_ = kNoPage;
     std::size_t pending_delete_page_ = 0;
+    std::size_t diagnostic_icon_position_ = kNoPage;
     std::size_t drag_source_visible_position_ = kNoPage;
     std::size_t drag_source_layout_index_ = kNoPage;
     std::size_t drag_target_visible_position_ = kNoPage;
@@ -8909,6 +9872,8 @@ private:
     int icon_load_budget_ = 0;
     UINT icon_request_pixels_ = kBaseIconRequestPixels;
     UINT fallback_frame_interval_ms_ = 8;
+    volatile LONG fallback_frame_tick_pending_ = FALSE;
+    volatile LONG fallback_frame_generation_ = 0;
     double clock_frequency_ = 0.0;
     std::int64_t clock_origin_ = 0;
     std::int64_t page_transition_origin_ = 0;
@@ -8924,10 +9889,13 @@ private:
     std::int64_t drag_press_origin_ = 0;
     std::int64_t folder_drag_press_origin_ = 0;
     std::int64_t drag_edge_hover_origin_ = 0;
+    std::int64_t diagnostic_autoplay_origin_ = 0;
+    std::int64_t diagnostic_icon_autoplay_origin_ = 0;
     std::int64_t frame_period_qpc_ = 0;
     std::int64_t next_frame_qpc_ = 0;
     std::int64_t vblank_qpc_ = 0;
     int page_transition_direction_ = 1;
+    int diagnostic_autoplay_direction_ = 1;
     float page_transition_width_ = 1.0F;
     float page_transition_start_offset_ = 0.0F;
     float page_transition_target_offset_ = 0.0F;
@@ -8945,13 +9913,26 @@ private:
     std::array<PageDragSample, 8> page_drag_samples_{};
     std::size_t page_drag_sample_count_ = 0;
     HANDLE frame_timer_ = nullptr;
+    MMRESULT fallback_frame_timer_id_ = 0;
+    D3D_FEATURE_LEVEL d3d_feature_level_ =
+        D3D_FEATURE_LEVEL_9_1;
+    launchpad::FrameDiagnostics frame_diagnostics_;
 
-    ComPtr<ID2D1Factory> factory_;
+    ComPtr<ID2D1Factory1> factory_;
     ComPtr<IDWriteFactory> write_factory_;
     ComPtr<IWICImagingFactory> wic_factory_;
     ComPtr<IDropTarget> external_drop_target_;
-    ComPtr<ID2D1HwndRenderTarget> render_target_;
-    ComPtr<ID2D1Bitmap> background_bitmap_;
+    ComPtr<ID3D11Device> d3d_device_;
+    ComPtr<ID3D11DeviceContext> d3d_context_;
+    ComPtr<IDXGIDevice> dxgi_device_;
+    ComPtr<IDXGISwapChain1> swap_chain_;
+    ComPtr<ID2D1Device> d2d_device_;
+    ComPtr<ID2D1DeviceContext> render_target_;
+    ComPtr<ID2D1Bitmap1> swap_chain_bitmap_;
+    ComPtr<IDCompositionDevice> composition_device_;
+    ComPtr<IDCompositionTarget> composition_target_;
+    ComPtr<IDCompositionVisual> composition_visual_;
+    ComPtr<ID2D1Bitmap1> background_bitmap_;
     ComPtr<ID2D1SolidColorBrush> white_brush_;
     ComPtr<ID2D1SolidColorBrush> color_brush_;
     ComPtr<IDWriteTextFormat> label_format_;

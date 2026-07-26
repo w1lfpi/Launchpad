@@ -19,6 +19,8 @@ endif()
 enable_language(RC)
 
 add_executable(Launchpad WIN32
+  src/frame_diagnostics.cpp
+  src/frame_diagnostics.h
   src/launchpad_layout.cpp
   src/launchpad_layout.h
   src/launchpad_model.cpp
@@ -38,8 +40,11 @@ target_compile_definitions(Launchpad PRIVATE
 
 target_link_libraries(Launchpad PRIVATE
   d2d1
+  d3d11
+  dcomp
   dwrite
   dwmapi
+  dxgi
   gdi32
   ole32
   propsys
