@@ -3581,11 +3581,15 @@ private:
         const float top =
             destination.top +
             (destination_height - height) * 0.5F;
+        const D2D1_RECT_F target =
+            D2D1::RectF(left, top, left + width, top + height);
         render_target_->DrawBitmap(
             bitmap,
-            D2D1::RectF(left, top, left + width, top + height),
+            &target,
             opacity,
-            D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
+            D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC,
+            nullptr,
+            nullptr);
         return true;
     }
 
