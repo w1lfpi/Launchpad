@@ -96,6 +96,8 @@ constexpr float kIconReleasePeakScale = 1.075F;
 constexpr float kIconReleaseDipScale = 0.985F;
 constexpr double kFolderAnimationSeconds = 0.28;
 constexpr double kFolderDropAnimationSeconds = 0.26;
+constexpr double kFolderIntentAnimationSeconds = 0.16;
+constexpr double kFolderAcceptAnimationSeconds = 0.14;
 constexpr double kRootReflowAnimationSeconds = 0.30;
 constexpr double kLiveReorderAnimationSeconds = 0.20;
 constexpr double kSearchFocusAnimationSeconds = 0.22;
@@ -2377,9 +2379,11 @@ private:
                     return 0;
                 }
             }
-            mouse_down_page_ = hit_test_page_dot(
-                GET_X_LPARAM(lparam),
-                GET_Y_LPARAM(lparam));
+            mouse_down_page_ = page_navigation_locked()
+                ? kNoPage
+                : hit_test_page_dot(
+                      GET_X_LPARAM(lparam),
+                      GET_Y_LPARAM(lparam));
             mouse_down_on_item_ =
                 mouse_down_page_ == kNoPage &&
                 update_pointer_selection(
@@ -2397,7 +2401,7 @@ private:
                     : kNoPage);
             if (mouse_down_on_item_ &&
                 search_.empty() &&
-                !page_transition_active_) {
+                !page_navigation_locked()) {
                 drag_candidate_ = true;
                 drag_source_visible_position_ =
                     selected_position_;
@@ -2414,22 +2418,21 @@ private:
                 SetCapture(hwnd_);
             }
             mouse_down_on_background_ =
+                (!page_navigation_locked() ||
+                 page_transition_active_) &&
                 mouse_down_page_ == kNoPage &&
                 !mouse_down_on_item_ &&
+                hit_test_page_dot(
+                    GET_X_LPARAM(lparam),
+                    GET_Y_LPARAM(lparam)) == kNoPage &&
                 !hit_test_search(
                     GET_X_LPARAM(lparam),
                     GET_Y_LPARAM(lparam));
             if (mouse_down_on_background_ &&
-                !page_transition_active_ &&
                 !closing_) {
-                page_drag_active_ = true;
-                page_drag_start_x_ = left_mouse_down_x_;
-                page_drag_start_y_ = left_mouse_down_y_;
-                page_drag_current_x_ = page_drag_start_x_;
-                page_drag_current_y_ = page_drag_start_y_;
-                page_drag_moved_ = false;
-                reset_page_drag_samples();
-                record_page_drag_sample(0.0F);
+                begin_page_drag(
+                    left_mouse_down_x_,
+                    left_mouse_down_y_);
                 SetCapture(hwnd_);
             }
             return 0;
@@ -2562,17 +2565,22 @@ private:
                 update_page_drag_moved();
                 const bool page_drag_moved =
                     page_drag_moved_;
-                record_page_drag_sample(delta.x);
+                const bool interrupted_transition =
+                    page_drag_interrupted_transition_;
+                const float raw_offset =
+                    page_drag_base_offset_ + delta.x;
+                record_page_drag_sample(raw_offset);
                 const float page_width = page_width_dips();
                 const float raw_velocity =
                     page_drag_velocity(page_width);
                 const PageDragVisual visual =
                     page_drag_visual(
-                        delta.x,
+                        raw_offset,
                         page_width,
                         raw_velocity);
                 page_drag_active_ = false;
                 page_drag_moved_ = false;
+                reset_page_drag_interruption();
                 if (GetCapture() == hwnd_) {
                     ReleaseCapture();
                 }
@@ -2607,7 +2615,8 @@ private:
                     InvalidateRect(hwnd_, nullptr, FALSE);
                     return 0;
                 }
-                if (page_drag_moved) {
+                if (page_drag_moved ||
+                    interrupted_transition) {
                     begin_page_return(
                         visual,
                         raw_velocity *
@@ -2675,18 +2684,24 @@ private:
                 update_page_drag_moved();
                 const bool page_drag_moved =
                     page_drag_moved_;
-                record_page_drag_sample(delta.x);
+                const bool interrupted_transition =
+                    page_drag_interrupted_transition_;
+                const float raw_offset =
+                    page_drag_base_offset_ + delta.x;
+                record_page_drag_sample(raw_offset);
                 const float page_width = page_width_dips();
                 const float raw_velocity =
                     page_drag_velocity(page_width);
                 const PageDragVisual visual =
                     page_drag_visual(
-                        delta.x,
+                        raw_offset,
                         page_width,
                         raw_velocity);
                 page_drag_active_ = false;
                 page_drag_moved_ = false;
-                if (page_drag_moved) {
+                reset_page_drag_interruption();
+                if (page_drag_moved ||
+                    interrupted_transition) {
                     begin_page_return(
                         visual,
                         raw_velocity *
@@ -3702,6 +3717,16 @@ private:
                 statistics_result =
                     swap_chain_->GetFrameStatistics(&statistics);
             }
+        }
+        const bool page_transition_frame_presented =
+            SUCCEEDED(result) &&
+            swap_chain_ &&
+            SUCCEEDED(presented);
+        if (page_transition_unlock_after_present_ &&
+            page_transition_frame_presented) {
+            page_transition_unlock_after_present_ = false;
+            page_transition_input_locked_ = false;
+            rearm_drag_edge_after_transition();
         }
         frame_diagnostics_.record_frame_statistics(
             statistics_result,
@@ -5482,6 +5507,7 @@ private:
         root_drag_reflow_active_ = false;
         root_drag_reflow_from_centers_.clear();
         root_drag_current_centers_.clear();
+        root_folder_intent_centers_.clear();
     }
 
     void seed_folder_drag_centers() {
@@ -5729,6 +5755,18 @@ private:
                         reflow_progress);
                 }
             }
+            if (drag_active_ &&
+                drag_folder_intent_locked_ &&
+                position != drag_source_visible_position_ &&
+                !visual_key.empty()) {
+                const auto frozen =
+                    root_folder_intent_centers_.find(visual_key);
+                if (frozen !=
+                    root_folder_intent_centers_.end()) {
+                    center_x = frozen->second.x;
+                    center_y = frozen->second.y;
+                }
+            }
             if (drag_active_ && !visual_key.empty()) {
                 root_drag_current_centers_.insert_or_assign(
                     visual_key,
@@ -5760,14 +5798,37 @@ private:
                         pi * current_folder_drop_progress()) *
                         0.075F
                 : 1.0F;
+            float folder_hover_scale = 1.0F;
+            if ((folder_intent_target || folder_drop_target) &&
+                folder_hover_origin_ != 0) {
+                const double hover_elapsed =
+                    elapsed_since(folder_hover_origin_);
+                const float intent_progress = smooth_step(
+                    static_cast<float>(
+                        hover_elapsed /
+                        kFolderIntentAnimationSeconds));
+                folder_hover_scale = lerp(
+                    1.0F,
+                    1.065F,
+                    intent_progress);
+                if (folder_drop_target) {
+                    const float accept_progress = smooth_step(
+                        static_cast<float>(
+                            (hover_elapsed -
+                             kFolderHoverActivationSeconds) /
+                            kFolderAcceptAnimationSeconds));
+                    folder_hover_scale = lerp(
+                        folder_hover_scale,
+                        1.12F,
+                        accept_progress);
+                }
+            }
             const float base_scale =
                 motion_scale *
                 accept_pulse *
-                (folder_drop_target
-                     ? 1.12F
-                     : (folder_intent_target
-                            ? 1.065F
-                            : (selected ? 1.035F : 1.0F)));
+                ((folder_drop_target || folder_intent_target)
+                     ? folder_hover_scale
+                     : (selected ? 1.035F : 1.0F));
             const float activation_scale =
                 root_icon_activation_scale(visible);
             const float scale =
@@ -6503,7 +6564,8 @@ private:
                 IconActivationPhase::released) {
             cancel_icon_activation();
         }
-        if (drag_active_ || drag_candidate_ ||
+        if (page_drag_active_ ||
+            drag_active_ || drag_candidate_ ||
             folder_drag_active_ || folder_drag_candidate_) {
             return true;
         }
@@ -6659,7 +6721,7 @@ private:
             return true;
         case VK_HOME:
             if (!visible_items_.empty() &&
-                !page_transition_active_ &&
+                !page_navigation_locked() &&
                 !closing_) {
                 selection_visible_ = true;
                 go_to_page(0);
@@ -6669,7 +6731,7 @@ private:
             return true;
         case VK_END:
             if (!visible_items_.empty() &&
-                !page_transition_active_ &&
+                !page_navigation_locked() &&
                 !closing_) {
                 selection_visible_ = true;
                 const std::size_t last_position =
@@ -6687,7 +6749,7 @@ private:
 
     void move_selection(int delta) {
         if (visible_items_.empty() ||
-            page_transition_active_ ||
+            page_navigation_locked() ||
             closing_) {
             return;
         }
@@ -6728,11 +6790,79 @@ private:
                 scale);
     }
 
+    void begin_page_drag(int x, int y) {
+        page_drag_base_offset_ = 0.0F;
+        page_drag_interrupted_transition_ = false;
+        page_drag_bridge_page_ = kNoPage;
+        page_drag_bridge_direction_ = 0;
+
+        if (page_transition_active_) {
+            const std::size_t from_page =
+                transition_from_page_;
+            const std::size_t neighbor_page =
+                page_transition_neighbor_page_;
+            const int transition_direction =
+                page_transition_direction_;
+            const float transition_width =
+                page_transition_width_;
+            const float transition_offset =
+                current_page_transition_offset();
+            const float drag_width = page_width_dips();
+            const float width_scale =
+                drag_width /
+                std::max(1.0F, transition_width);
+            const float scaled_transition_offset =
+                transition_offset * width_scale;
+
+            if (current_page_ == from_page) {
+                page_drag_base_offset_ =
+                    scaled_transition_offset;
+                page_drag_bridge_page_ =
+                    neighbor_page;
+                page_drag_bridge_direction_ =
+                    transition_direction;
+                page_drag_interrupted_transition_ = true;
+            } else if (current_page_ == neighbor_page) {
+                page_drag_base_offset_ =
+                    scaled_transition_offset +
+                    static_cast<float>(
+                        transition_direction) *
+                        drag_width;
+                page_drag_bridge_page_ = from_page;
+                page_drag_bridge_direction_ =
+                    -transition_direction;
+                page_drag_interrupted_transition_ = true;
+            }
+            page_drag_base_offset_ = std::clamp(
+                page_drag_base_offset_,
+                -drag_width,
+                drag_width);
+            reset_page_motion();
+        }
+
+        page_drag_active_ = true;
+        page_drag_start_x_ = x;
+        page_drag_start_y_ = y;
+        page_drag_current_x_ = x;
+        page_drag_current_y_ = y;
+        page_drag_moved_ = false;
+        reset_page_drag_samples();
+        record_page_drag_sample(page_drag_base_offset_);
+    }
+
+    void reset_page_drag_interruption() {
+        page_drag_base_offset_ = 0.0F;
+        page_drag_interrupted_transition_ = false;
+        page_drag_bridge_page_ = kNoPage;
+        page_drag_bridge_direction_ = 0;
+    }
+
     float page_drag_raw_offset() const {
-        return client_delta_to_dips(
-                   page_drag_current_x_ - page_drag_start_x_,
-                   page_drag_current_y_ - page_drag_start_y_)
-            .x;
+        return page_drag_base_offset_ +
+            client_delta_to_dips(
+                page_drag_current_x_ - page_drag_start_x_,
+                page_drag_current_y_ - page_drag_start_y_)
+                .x;
     }
 
     void update_page_drag_moved() {
@@ -6839,26 +6969,41 @@ private:
         float raw_offset,
         float page_width,
         float raw_velocity) const {
-        const float direction_source =
-            std::abs(raw_offset) >= 4.0F
-                ? raw_offset
-                : raw_velocity;
-        const int direction =
-            direction_source < 0.0F ? 1 : -1;
+        int direction = -1;
+        if (std::abs(raw_offset) >= 4.0F) {
+            direction = raw_offset < 0.0F ? 1 : -1;
+        } else if (std::abs(raw_velocity) >= 1.0F) {
+            direction = raw_velocity < 0.0F ? 1 : -1;
+        } else if (
+            page_drag_interrupted_transition_ &&
+            page_drag_bridge_direction_ != 0) {
+            direction = page_drag_bridge_direction_;
+        }
         const std::size_t count = effective_page_count();
         std::size_t neighbor = kNoPage;
-        if (direction > 0 && current_page_ + 1 < count) {
+        const bool using_interrupted_bridge =
+            page_drag_interrupted_transition_ &&
+            direction == page_drag_bridge_direction_;
+        if (using_interrupted_bridge) {
+            if (page_drag_bridge_page_ < count) {
+                neighbor = page_drag_bridge_page_;
+            }
+        } else if (
+            direction > 0 &&
+            current_page_ + 1 < count) {
             neighbor = current_page_ + 1;
         } else if (direction < 0 && current_page_ > 0) {
             neighbor = current_page_ - 1;
         }
 
         if (neighbor != kNoPage) {
-            constexpr float linear_fraction = 0.80F;
+            const float linear_fraction =
+                using_interrupted_bridge ? 1.0F : 0.80F;
             const float linear_limit =
                 page_width * linear_fraction;
-            const float tail =
-                page_width - linear_limit;
+            const float tail = using_interrupted_bridge
+                ? page_width * 0.12F
+                : page_width - linear_limit;
             const float magnitude =
                 std::abs(raw_offset);
             if (magnitude <= linear_limit) {
@@ -6884,6 +7029,29 @@ private:
         }
 
         const float limit = page_width * 0.12F;
+        if (using_interrupted_bridge) {
+            const float magnitude = std::abs(raw_offset);
+            if (magnitude <= limit) {
+                return PageDragVisual{
+                    .direction = direction,
+                    .neighbor = kNoPage,
+                    .offset = raw_offset,
+                    .velocity_scale = 1.0F,
+                };
+            }
+            const float decay = std::exp(
+                -(magnitude - limit) /
+                std::max(1.0F, limit));
+            return PageDragVisual{
+                .direction = direction,
+                .neighbor = kNoPage,
+                .offset = std::copysign(
+                    limit +
+                        limit * (1.0F - decay),
+                    raw_offset),
+                .velocity_scale = decay,
+            };
+        }
         constexpr float slope = 0.22F;
         const float magnitude = std::abs(raw_offset);
         const float decay = std::exp(
@@ -6903,7 +7071,7 @@ private:
         int delta,
         float initial_drag_offset = 0.0F,
         float initial_velocity = 0.0F) {
-        if (page_transition_active_ || closing_) {
+        if (page_navigation_locked() || closing_) {
             return;
         }
         const std::size_t count = effective_page_count();
@@ -6918,7 +7086,7 @@ private:
     }
 
     void accumulate_wheel(int delta, bool horizontal) {
-        if (page_transition_active_ || closing_) {
+        if (page_navigation_locked() || closing_) {
             vertical_wheel_remainder_ = 0;
             horizontal_wheel_remainder_ = 0;
             return;
@@ -6942,7 +7110,7 @@ private:
         std::size_t new_page,
         float initial_drag_offset = 0.0F,
         float initial_velocity = 0.0F) {
-        if (page_transition_active_ || closing_) {
+        if (page_navigation_locked() || closing_) {
             return;
         }
         const std::size_t count = effective_page_count();
@@ -7014,12 +7182,17 @@ private:
             (std::abs(target - start) > 0.01F ||
              std::abs(page_transition_initial_velocity_) >
                  kPageSettleVelocityDipsPerSecond);
+        page_transition_input_locked_ =
+            page_transition_active_;
+        page_transition_unlock_after_present_ = false;
         vertical_wheel_remainder_ = 0;
         horizontal_wheel_remainder_ = 0;
     }
 
     void reset_page_motion() {
         page_transition_active_ = false;
+        page_transition_input_locked_ = false;
+        page_transition_unlock_after_present_ = false;
         transition_from_page_ = current_page_;
         page_transition_neighbor_page_ = kNoPage;
         page_transition_direction_ = 1;
@@ -7095,15 +7268,22 @@ private:
             page_transition_start_offset_ =
                 page_transition_target_offset_;
             page_transition_initial_velocity_ = 0.0F;
-            rearm_drag_edge_after_transition();
+            page_transition_unlock_after_present_ =
+                page_transition_input_locked_;
             return page_transition_target_offset_;
         }
         return offset;
     }
 
+    bool page_navigation_locked() const {
+        return page_transition_active_ ||
+            page_transition_input_locked_ ||
+            page_drag_active_;
+    }
+
     bool update_pointer_selection(int x, int y) {
         if (!render_target_ ||
-            page_transition_active_ ||
+            page_navigation_locked() ||
             page_drag_active_ ||
             closing_) {
             return false;
@@ -7536,7 +7716,6 @@ private:
         drag_current_y_ = y;
         const D2D1_POINT_2F point = client_point_to_dips(x, y);
         std::size_t next_target = kNoPage;
-        const HitRegion* target_region = nullptr;
         for (const HitRegion& region : root_drop_regions_) {
             if (point.x < region.bounds.left ||
                 point.x > region.bounds.right ||
@@ -7545,97 +7724,192 @@ private:
                 continue;
             }
             next_target = region.visible_position;
-            target_region = &region;
             break;
         }
 
-        bool folder_hover = false;
-        bool existing_folder_target = false;
-        if (target_region &&
-            next_target != drag_source_visible_position_ &&
-            drag_source_kind_ == VisibleItemKind::app &&
+        std::size_t visual_folder_target = kNoPage;
+        float visual_folder_distance =
+            std::numeric_limits<float>::max();
+        if (drag_source_kind_ == VisibleItemKind::app &&
             drag_source_visible_position_ <
-                visible_items_.size() &&
-            next_target < visible_items_.size()) {
-            const VisibleItem& target =
-                visible_items_[next_target];
-            existing_folder_target =
-                target.kind == VisibleItemKind::folder;
-            if (existing_folder_target ||
-                target.kind == VisibleItemKind::app) {
-                const float width =
-                    target_region->icon_bounds.right -
-                    target_region->icon_bounds.left;
-                const float height =
-                    target_region->icon_bounds.bottom -
-                    target_region->icon_bounds.top;
-                // Existing folders get a generous magnetic area,
-                // while the outer edge of the cell still remains
-                // available for ordinary reordering.
-                const bool already_locked =
+                visible_items_.size()) {
+            for (const HitRegion& visual_region : hit_regions_) {
+                const std::size_t position =
+                    visual_region.visible_position;
+                if (position == drag_source_visible_position_ ||
+                    position >= visible_items_.size() ||
+                    visible_items_[position].kind !=
+                        VisibleItemKind::folder) {
+                    continue;
+                }
+                const auto logical_region = std::ranges::find_if(
+                    root_drop_regions_,
+                    [position](const HitRegion& region) {
+                        return region.visible_position == position;
+                    });
+                if (logical_region == root_drop_regions_.end()) {
+                    continue;
+                }
+                const float center_x =
+                    (visual_region.icon_bounds.left +
+                     visual_region.icon_bounds.right) *
+                    0.5F;
+                const float center_y =
+                    (visual_region.icon_bounds.top +
+                     visual_region.icon_bounds.bottom) *
+                    0.5F;
+                const float cell_width =
+                    logical_region->bounds.right -
+                    logical_region->bounds.left;
+                const float cell_height =
+                    logical_region->bounds.bottom -
+                    logical_region->bounds.top;
+                const bool sticky =
                     drag_folder_intent_locked_ &&
                     folder_hover_candidate_visible_position_ ==
-                        next_target;
-                const float expansion =
-                    existing_folder_target
-                    ? (already_locked ? 0.48F : 0.38F)
-                    : (already_locked ? 0.28F : 0.20F);
-                const D2D1_RECT_F intent_bounds = D2D1::RectF(
-                    target_region->icon_bounds.left -
-                        width * expansion,
-                    target_region->icon_bounds.top -
-                        height * expansion,
-                    target_region->icon_bounds.right +
-                        width * expansion,
-                    target_region->icon_bounds.bottom +
-                        height * expansion);
-                folder_hover =
-                    point.x >= intent_bounds.left &&
-                    point.x <= intent_bounds.right &&
-                    point.y >= intent_bounds.top &&
-                    point.y <= intent_bounds.bottom;
+                        position;
+                const float exit_expansion = sticky ? 0.10F : 0.0F;
+                const D2D1_RECT_F visual_cell = D2D1::RectF(
+                    center_x -
+                        cell_width * (0.5F + exit_expansion),
+                    center_y -
+                        cell_height * (0.5F + exit_expansion),
+                    center_x +
+                        cell_width * (0.5F + exit_expansion),
+                    center_y +
+                        cell_height * (0.5F + exit_expansion));
+                if (point.x < visual_cell.left ||
+                    point.x > visual_cell.right ||
+                    point.y < visual_cell.top ||
+                    point.y > visual_cell.bottom) {
+                    continue;
+                }
+                const float delta_x = point.x - center_x;
+                const float delta_y = point.y - center_y;
+                const float distance =
+                    delta_x * delta_x + delta_y * delta_y;
+                if (distance < visual_folder_distance) {
+                    visual_folder_distance = distance;
+                    visual_folder_target = position;
+                }
             }
         }
 
-        if (folder_hover) {
+        std::size_t visual_app_target = kNoPage;
+        float visual_app_distance =
+            std::numeric_limits<float>::max();
+        if (visual_folder_target == kNoPage &&
+            drag_source_kind_ == VisibleItemKind::app) {
+            for (const HitRegion& visual_region : hit_regions_) {
+                const std::size_t position =
+                    visual_region.visible_position;
+                if (position == drag_source_visible_position_ ||
+                    position >= visible_items_.size() ||
+                    visible_items_[position].kind !=
+                        VisibleItemKind::app) {
+                    continue;
+                }
+                const float width =
+                    visual_region.icon_bounds.right -
+                    visual_region.icon_bounds.left;
+                const float height =
+                    visual_region.icon_bounds.bottom -
+                    visual_region.icon_bounds.top;
+                const bool sticky =
+                    drag_folder_intent_locked_ &&
+                    folder_hover_candidate_visible_position_ ==
+                        position;
+                const float expansion = sticky ? 0.38F : 0.28F;
+                const float center_x =
+                    (visual_region.icon_bounds.left +
+                     visual_region.icon_bounds.right) *
+                    0.5F;
+                const float center_y =
+                    (visual_region.icon_bounds.top +
+                     visual_region.icon_bounds.bottom) *
+                    0.5F;
+                const D2D1_RECT_F intent_bounds = D2D1::RectF(
+                    visual_region.icon_bounds.left -
+                        width * expansion,
+                    visual_region.icon_bounds.top -
+                        height * expansion,
+                    visual_region.icon_bounds.right +
+                        width * expansion,
+                    visual_region.icon_bounds.bottom +
+                        height * expansion);
+                if (point.x < intent_bounds.left ||
+                    point.x > intent_bounds.right ||
+                    point.y < intent_bounds.top ||
+                    point.y > intent_bounds.bottom) {
+                    continue;
+                }
+                const float delta_x = point.x - center_x;
+                const float delta_y = point.y - center_y;
+                const float distance =
+                    delta_x * delta_x + delta_y * delta_y;
+                if (distance < visual_app_distance) {
+                    visual_app_distance = distance;
+                    visual_app_target = position;
+                }
+            }
+        }
+
+        const std::size_t visual_intent_target =
+            visual_folder_target != kNoPage
+                ? visual_folder_target
+                : visual_app_target;
+        if (visual_intent_target != kNoPage) {
+            if (!drag_folder_intent_locked_ ||
+                root_folder_intent_centers_.empty()) {
+                seed_root_drag_centers();
+                root_folder_intent_centers_ =
+                    root_drag_current_centers_;
+            }
             if (folder_hover_candidate_visible_position_ !=
-                next_target) {
+                visual_intent_target) {
                 folder_hover_candidate_visible_position_ =
-                    next_target;
+                    visual_intent_target;
                 LARGE_INTEGER counter{};
                 QueryPerformanceCounter(&counter);
                 folder_hover_origin_ = counter.QuadPart;
             }
-        } else {
-            folder_hover_candidate_visible_position_ = kNoPage;
-            folder_hover_origin_ = 0;
-        }
-
-        std::size_t next_folder_target = kNoPage;
-        if (existing_folder_target && folder_hover) {
-            next_folder_target = next_target;
-        } else if (folder_hover &&
-            folder_hover_candidate_visible_position_ ==
-                next_target &&
-            elapsed_since(folder_hover_origin_) >=
-                kFolderHoverActivationSeconds) {
-            next_folder_target = next_target;
-        }
-
-        if (next_target != drag_target_visible_position_ ||
-            next_folder_target !=
-                folder_drop_target_visible_position_ ||
-            folder_hover != drag_folder_intent_locked_) {
-            begin_root_live_reflow();
-            drag_target_visible_position_ = next_target;
+            const std::size_t next_folder_target =
+                elapsed_since(folder_hover_origin_) >=
+                        kFolderHoverActivationSeconds
+                    ? visual_intent_target
+                    : kNoPage;
             folder_drop_target_visible_position_ =
                 next_folder_target;
-            drag_folder_intent_locked_ = folder_hover;
+            drag_folder_intent_locked_ = true;
+            drag_edge_direction_ = 0;
+            drag_edge_latched_ = false;
+            write_drag_diagnostic(
+                next_folder_target != kNoPage
+                    ? L"move-folder"
+                    : L"move-folder-intent",
+                x,
+                y,
+                visual_intent_target);
+            InvalidateRect(hwnd_, nullptr, FALSE);
+            return;
+        }
+
+        const bool leaving_folder_intent =
+            drag_folder_intent_locked_ ||
+            folder_hover_candidate_visible_position_ != kNoPage ||
+            folder_drop_target_visible_position_ != kNoPage;
+        if (next_target != drag_target_visible_position_ ||
+            leaving_folder_intent) {
+            begin_root_live_reflow();
+            root_folder_intent_centers_.clear();
+            drag_target_visible_position_ = next_target;
+            folder_drop_target_visible_position_ = kNoPage;
+            folder_hover_candidate_visible_position_ = kNoPage;
+            folder_hover_origin_ = 0;
+            drag_folder_intent_locked_ = false;
         }
         write_drag_diagnostic(
-            folder_drop_target_visible_position_ != kNoPage
-                ? L"move-folder"
-                : L"move",
+            L"move",
             x,
             y,
             drag_target_visible_position_);
@@ -7644,24 +7918,34 @@ private:
     }
 
     void maybe_activate_folder_hover() {
+        const bool valid_candidate =
+            folder_hover_candidate_visible_position_ <
+                visible_items_.size() &&
+            folder_hover_candidate_visible_position_ !=
+                drag_source_visible_position_ &&
+            (visible_items_[
+                 folder_hover_candidate_visible_position_].kind ==
+                 VisibleItemKind::app ||
+             visible_items_[
+                 folder_hover_candidate_visible_position_].kind ==
+                 VisibleItemKind::folder);
         if (!drag_active_ ||
             folder_drop_target_visible_position_ != kNoPage ||
             !drag_folder_intent_locked_ ||
-            folder_hover_candidate_visible_position_ == kNoPage ||
-            folder_hover_candidate_visible_position_ !=
-                drag_target_visible_position_ ||
+            !valid_candidate ||
             elapsed_since(folder_hover_origin_) <
                 kFolderHoverActivationSeconds) {
             return;
         }
-        begin_root_live_reflow();
         folder_drop_target_visible_position_ =
             folder_hover_candidate_visible_position_;
         InvalidateRect(hwnd_, nullptr, FALSE);
     }
 
     void update_drag_edge_hover_state() {
-        if (!drag_active_ || !render_target_) {
+        if (!drag_active_ || !render_target_ ||
+            drag_folder_intent_locked_ ||
+            folder_drop_target_visible_position_ != kNoPage) {
             drag_edge_direction_ = 0;
             drag_edge_latched_ = false;
             return;
@@ -7708,7 +7992,7 @@ private:
         if (!drag_active_ ||
             drag_edge_direction_ == 0 ||
             drag_edge_latched_ ||
-            page_transition_active_ ||
+            page_navigation_locked() ||
             elapsed_since(drag_edge_hover_origin_) <
                 kDragEdgeHoverSeconds) {
             return;
@@ -7759,11 +8043,21 @@ private:
         const bool drop_on_new_page =
             drag_provisional_page_ &&
             destination_page >= visible_page_count();
+        std::size_t effective_folder_target =
+            folder_drop_target_visible_position_;
+        if (effective_folder_target == kNoPage &&
+            drag_folder_intent_locked_ &&
+            folder_hover_candidate_visible_position_ <
+                visible_items_.size()) {
+            // Releasing before the dwell animation finishes must still be a
+            // valid folder add/create action, never a hidden reorder.
+            effective_folder_target =
+                folder_hover_candidate_visible_position_;
+        }
         const bool dropping_into_folder =
             !drop_on_new_page &&
-            folder_drop_target_visible_position_ != kNoPage &&
-            folder_drop_target_visible_position_ <
-                visible_items_.size() &&
+            effective_folder_target != kNoPage &&
+            effective_folder_target < visible_items_.size() &&
             drag_source_layout_index_ < layout_.items().size() &&
             layout_.items()[drag_source_layout_index_].kind ==
                 launchpad::LayoutItemKind::app;
@@ -7798,12 +8092,10 @@ private:
                     drag_source_layout_index_) ||
                 changed;
         } else if (
-            folder_drop_target_visible_position_ != kNoPage &&
-            folder_drop_target_visible_position_ <
-                visible_items_.size()) {
+            effective_folder_target != kNoPage &&
+            effective_folder_target < visible_items_.size()) {
             const VisibleItem target =
-                visible_items_[
-                    folder_drop_target_visible_position_];
+                visible_items_[effective_folder_target];
             if (target.kind == VisibleItemKind::folder) {
                 changed =
                     layout_.add_app_to_folder(
@@ -7848,8 +8140,8 @@ private:
             changed ? L"finish-changed" : L"finish-unchanged",
             drag_current_x_,
             drag_current_y_,
-            folder_drop_target_visible_position_ != kNoPage
-                ? folder_drop_target_visible_position_
+            effective_folder_target != kNoPage
+                ? effective_folder_target
                 : drag_target_visible_position_);
 
         drag_active_ = false;
@@ -8619,7 +8911,7 @@ private:
     void launch_selected() {
         if (visible_items_.empty() ||
             selected_position_ >= visible_items_.size() ||
-            page_transition_active_ ||
+            page_navigation_locked() ||
             page_drag_active_ ||
             closing_) {
             cancel_icon_activation(true);
@@ -8660,7 +8952,7 @@ private:
 
         if (open_folder_index_ == kNoPage &&
             search_.empty() &&
-            !page_transition_active_ &&
+            !page_navigation_locked() &&
             !page_drag_active_) {
             const std::size_t position =
                 hit_test_regions(hit_regions_, x, y);
@@ -9180,6 +9472,7 @@ private:
         reset_page_motion();
         page_drag_active_ = false;
         page_drag_moved_ = false;
+        reset_page_drag_interruption();
         mouse_down_on_item_ = false;
         mouse_down_on_background_ = false;
         mouse_down_page_ = kNoPage;
@@ -9420,6 +9713,7 @@ private:
             (animations_enabled_ &&
              (!intro_complete_ ||
               page_transition_active_ ||
+              page_transition_unlock_after_present_ ||
               folder_animation_active_ ||
               folder_name_editing_ ||
               folder_drop_animation_active_ ||
@@ -9756,6 +10050,8 @@ private:
     bool animations_enabled_ = true;
     bool intro_complete_ = false;
     bool page_transition_active_ = false;
+    bool page_transition_input_locked_ = false;
+    bool page_transition_unlock_after_present_ = false;
     bool closing_ = false;
     bool mouse_down_on_item_ = false;
     bool mouse_down_on_background_ = false;
@@ -9763,6 +10059,7 @@ private:
     bool mouse_down_on_folder_background_ = false;
     bool page_drag_active_ = false;
     bool page_drag_moved_ = false;
+    bool page_drag_interrupted_transition_ = false;
     bool selection_visible_ = false;
     bool folder_selection_visible_ = false;
     bool folder_animation_active_ = false;
@@ -9824,6 +10121,8 @@ private:
     std::unordered_map<std::wstring, D2D1_POINT_2F>
         root_drag_current_centers_;
     std::unordered_map<std::wstring, D2D1_POINT_2F>
+        root_folder_intent_centers_;
+    std::unordered_map<std::wstring, D2D1_POINT_2F>
         folder_drag_reflow_from_centers_;
     std::unordered_map<std::wstring, D2D1_POINT_2F>
         folder_drag_current_centers_;
@@ -9835,6 +10134,7 @@ private:
     std::size_t current_page_ = 0;
     std::size_t transition_from_page_ = 0;
     std::size_t page_transition_neighbor_page_ = kNoPage;
+    std::size_t page_drag_bridge_page_ = kNoPage;
     std::size_t selected_position_ = 0;
     std::size_t open_folder_index_ = kNoPage;
     std::size_t folder_selected_position_ = 0;
@@ -9899,11 +10199,13 @@ private:
     std::int64_t next_frame_qpc_ = 0;
     std::int64_t vblank_qpc_ = 0;
     int page_transition_direction_ = 1;
+    int page_drag_bridge_direction_ = 0;
     int diagnostic_autoplay_direction_ = 1;
     float page_transition_width_ = 1.0F;
     float page_transition_start_offset_ = 0.0F;
     float page_transition_target_offset_ = 0.0F;
     float page_transition_initial_velocity_ = 0.0F;
+    float page_drag_base_offset_ = 0.0F;
     float close_start_visibility_ = 1.0F;
     float search_focus_progress_ = 0.0F;
     float search_focus_from_ = 0.0F;

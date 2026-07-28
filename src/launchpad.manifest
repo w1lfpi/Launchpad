@@ -3,7 +3,7 @@
   <assemblyIdentity
     type="win32"
     name="WindowsLaunchpad"
-    version="0.3.0.0"
+    version="0.4.0.0"
     processorArchitecture="*" />
   <description>Windows Launchpad</description>
   <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">

@@ -15,7 +15,7 @@
 
 ## Установка
 
-Скачайте `WindowsLaunchpad-0.3.0-Setup-x64.exe` со страницы
+Скачайте `WindowsLaunchpad-0.4.0-Setup-x64.exe` со страницы
 [Releases](https://github.com/w1lfpi/Launchpad/releases), запустите файл и
 пройдите обычную установку. Права администратора и Visual C++ Runtime не
 требуются.
